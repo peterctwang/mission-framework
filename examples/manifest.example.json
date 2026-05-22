@@ -1,0 +1,45 @@
+{
+  "mission": "Add a CLI flag --dry-run to the existing deploy script",
+  "validation_contract": "contracts/deploy-dry-run.md",
+  "subtasks": [
+    {
+      "id": "T-01",
+      "desc": "Parse --dry-run flag in argparse setup",
+      "difficulty": "T1",
+      "execution": "serial",
+      "depends_on": [],
+      "default_profile": "P-CODE",
+      "escalation_profile": null,
+      "needs_validator": false,
+      "validator_profile": null,
+      "covers": ["AC-1"],
+      "status": "todo"
+    },
+    {
+      "id": "T-02",
+      "desc": "Guard all mutation calls behind dry-run check; log intended actions instead",
+      "difficulty": "T2",
+      "execution": "serial",
+      "depends_on": ["T-01"],
+      "default_profile": "P-CODE",
+      "escalation_profile": "P-REASON",
+      "needs_validator": true,
+      "validator_profile": "P-JUDGE",
+      "covers": ["AC-2", "AC-3", "AC-4"],
+      "status": "todo"
+    },
+    {
+      "id": "T-03",
+      "desc": "Add integration test exercising dry-run mode end-to-end",
+      "difficulty": "T2",
+      "execution": "serial",
+      "depends_on": ["T-02"],
+      "default_profile": "P-CODE",
+      "escalation_profile": null,
+      "needs_validator": true,
+      "validator_profile": "P-JUDGE",
+      "covers": ["AC-5"],
+      "status": "todo"
+    }
+  ]
+}

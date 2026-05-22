@@ -1,0 +1,2 @@
+# No Python deps required — all four providers go through CLI subprocesses
+# (claude / codex / gemini) or built-in urllib (minimax).

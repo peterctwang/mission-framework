@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Secrets — never commit credentials
+.env
+.env.local
+.env.*.local
+
+# Per-project state (created by the runner inside the consumer's project)
+.harness-state.json
+.cache/
+artifacts/
+run.log.jsonl
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+.claude/
+
+# Per-user local artifacts not meant for the public repo
+模型清單.md
+
+# OS
+.DS_Store
+Thumbs.db
