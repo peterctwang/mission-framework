@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config
+from . import skills as _skills
 from .providers import Provider, QuotaExhausted, TransientProviderError
 from .quota import QuotaTracker
 
@@ -45,6 +46,14 @@ TOKEN_BUDGETS = {
     "worker": 8192,
     "validator": 2048,
     "orchestrator": 4096,
+}
+
+# Factory's reference run shows median 51 turns / impl, 30 / validation.
+# We set a generous cap as a runaway-loop guardrail; trips on stuck workers.
+TURN_CAPS = {
+    "worker": 80,
+    "validator": 50,
+    "orchestrator": 30,
 }
 
 HANDOFF_WORD_CAP = 200
@@ -87,7 +96,11 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _load_soul(role: str) -> str:
+def _load_soul(role: str, *, mode: str = "default") -> str:
+    """Validators come in two flavors: scrutiny (code review) and
+    functional (black-box). Default mode = scrutiny."""
+    if role == "validator" and mode == "functional":
+        return _read(SOULS_DIR / "validator-functional.md")
     return _read(SOULS_DIR / f"{role}.md")
 
 
@@ -113,18 +126,22 @@ def _save_artifact(out_dir: Path, subtask_id: str, label: str, content: str) -> 
 def _build_system(role: str, *, mode: str = "default") -> str:
     """Compose [SOUL] + [TEMPLATE] for a role.
 
-    `mode='resolve'` for Orchestrator is the escalation-handler variant —
-    uses the same SOUL but a different template that expects an
-    ESCALATE_TO_ORCHESTRATOR payload in the user prompt.
+    Modes:
+      - orchestrator/default — initial planning prompt
+      - orchestrator/resolve — escalation handler
+      - worker/default       — implementation prompt
+      - validator/default    — scrutiny (code review)
+      - validator/functional — black-box (actually runs the system)
     """
     role_to_template = {
         ("orchestrator", "default"): "1-orchestrator.md",
         ("orchestrator", "resolve"): "5-orchestrator-resolve.md",
         ("worker", "default"): "2-worker.md",
         ("validator", "default"): "3-validator.md",
+        ("validator", "functional"): "6-validator-functional.md",
     }
     tmpl = role_to_template[(role, mode)]
-    return f"{_load_soul(role)}\n\n---\n\n{_load_template(tmpl)}"
+    return f"{_load_soul(role, mode=mode)}\n\n---\n\n{_load_template(tmpl)}"
 
 
 # Pattern to detect Worker's escalation request in its output.
@@ -321,6 +338,74 @@ def _resolve_escalation(
     return decision
 
 
+def _orchestrator_decide_fix(
+    *,
+    subtask: dict,
+    worker_output: str,
+    validator_feedback: str,
+    manifest: dict,
+    manifest_path: Path,
+    contract: str,
+    project_dir: Path,
+    out_dir: Path,
+    cache: "ResponseCache",
+    tracker: QuotaTracker,
+    log: Callable[..., None],
+) -> dict | None:
+    """Factory-style fix-features pattern: after multiple validator rejects,
+    instead of letting the same Worker keep failing, ask the Orchestrator
+    (Opus) to either issue a precise DIRECTIVE or REPLAN a clean-context
+    fix subtask (`split_into` a T-XX-fix child).
+
+    The reasoning is that a Worker that has already failed on a piece is
+    poorly positioned to objectively diagnose the gap — a fresh agent with
+    only the validator's complaint as input does better.
+    """
+    orch_system = _build_system("orchestrator", mode="resolve")
+    orch_user = (
+        f"## Mission\n{manifest.get('mission', '')}\n\n"
+        f"## Subtask that keeps failing\n```json\n"
+        f"{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
+        f"## Relevant validation contract items\n"
+        f"{_relevant_contract(contract, subtask.get('covers') or [])}\n\n"
+        f"## Worker's latest output (rejected)\n{worker_output[:4000]}\n\n"
+        f"## Validator's reject reasoning\n{validator_feedback[:3000]}\n\n"
+        f"This subtask has been rejected multiple times. As Orchestrator you "
+        f"must decide:\n"
+        f"  - **DIRECTIVE**: a one-paragraph directive the next Worker attempt "
+        f"will receive. Use if the gap is well-defined and small.\n"
+        f"  - **REPLAN with `split_into`**: spawn a clean fix subtask "
+        f"(id=`{subtask['id']}-fix`) targeting only the validator's complaints. "
+        f"Use this when the Worker is clearly stuck and needs a fresh context.\n\n"
+        f"Respond with exactly ONE `## ORCHESTRATOR_DECISION` JSON block."
+    )
+    log("orchestrator-fix-start", id=subtask["id"])
+    text, used, _ = _call_with_failover(
+        config.ORCHESTRATOR_CHAIN, orch_system, orch_user,
+        role="orchestrator", cache=cache, tracker=tracker,
+        forbidden=None, log=log, use_cache=False,
+    )
+    _save_artifact(out_dir, subtask["id"], "orchestrator-fix", text)
+    log("orchestrator-fix-done", id=subtask["id"],
+        provider=used.name, model=used.model)
+
+    m = _ORCH_DECISION_RE.search(text)
+    if not m:
+        log("orchestrator-fix-malformed", id=subtask["id"])
+        return None
+    decision = _extract_json_block(m.group(1))
+    if not decision or "action" not in decision:
+        log("orchestrator-fix-malformed", id=subtask["id"])
+        return None
+    decision["action"] = decision["action"].upper()
+    if decision["action"] == "REPLAN":
+        _apply_replan(subtask, decision, manifest)
+        _save_manifest(manifest_path, manifest)
+        log("manifest-patched", id=subtask["id"],
+            note=f"fix-feature: {len(decision.get('subtask_patches', []))} patch(es)")
+    return decision
+
+
 def _apply_replan(subtask: dict, decision: dict, manifest: dict) -> None:
     """Patch the manifest based on Orchestrator's REPLAN payload.
 
@@ -475,6 +560,14 @@ def _call_with_failover(
             result.usage.input_tokens, result.usage.output_tokens,
             result.usage.cached_input_tokens,
         )
+        # Trajectory observability — emit a warning when the agent loop
+        # ran longer than expected (caps from TURN_CAPS).
+        cap = TURN_CAPS.get(role, 100)
+        if result.usage.turns and result.usage.turns > cap:
+            log("trajectory-cap-exceeded", role=role, provider=provider.name,
+                turns=result.usage.turns, cap=cap)
+        elif result.usage.turns:
+            log("trajectory", role=role, provider=provider.name, turns=result.usage.turns)
         cache.put(key, result.text)
         return result.text, provider, False
     raise RuntimeError("call_with_failover exhausted all providers in chain")
@@ -553,10 +646,16 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
 
             ac_excerpt = _relevant_contract(contract, subtask.get("covers") or [])
             worker_system = _build_system("worker")
+            # Optional: surface relevant skills from ~/.mission/skills/ that
+            # match this subtask's description. Cheap keyword search.
+            skill_ctx = _skills.load_skills_for_mission(
+                subtask.get("desc", "") + " " + manifest.get("mission", ""),
+            )
             worker_user = (
                 f"## Current subtask\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
                 f"## Relevant validation contract items\n{ac_excerpt}\n\n"
-                f"## Previous handoff\n{handoff or '(none — first subtask)'}\n"
+                + (f"{skill_ctx}\n\n" if skill_ctx else "")
+                + f"## Previous handoff\n{handoff or '(none — first subtask)'}\n"
             )
 
             # Worker chain is now picked by SUBTASK DIFFICULTY (T1/T2/T3),
@@ -654,11 +753,14 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
                 _save_manifest(manifest_path, manifest)
                 continue
 
-            # Validator chain is fixed (Codex primary). The validator_profile
-            # field in the manifest is now ignored — Codex is always the
-            # primary judge because it follows directive prompts reliably.
+            # Validator chain is fixed (Codex primary). The validation_kind
+            # field on the subtask selects between scrutiny (code review,
+            # default) and functional (runs the system end-to-end via Bash).
             validator_chain = config.VALIDATOR_CHAIN
-            validator_system = _build_system("validator")
+            validation_kind = subtask.get("validation_kind", "scrutiny")
+            validator_mode = "functional" if validation_kind == "functional" else "default"
+            validator_system = _build_system("validator", mode=validator_mode)
+            log("validator-config", id=sid, kind=validation_kind)
 
             attempt = 1
             passed = False
@@ -690,24 +792,43 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
 
                 log("validator-reject", id=sid, attempt=attempt)
                 last_reject_feedback = v_text
-                # On the 2nd reject, escalate the Worker by bumping one
-                # difficulty tier (T1→T2, T2→T3). If already at T3 or the
-                # manifest names an explicit escalation_profile, honor that.
+
+                # Fix-features pattern (Factory Missions §4):
+                # On the 2nd reject, hand control to the Orchestrator (Opus).
+                # It can either issue a DIRECTIVE for one more retry, or
+                # REPLAN with split_into → spawn a clean-context fix subtask.
+                # Difficulty escalation is now part of the Orchestrator's
+                # toolkit (it can change `difficulty` via REPLAN), not a
+                # hardcoded bump.
                 if attempt == 2:
-                    explicit = subtask.get("escalation_profile")
-                    if explicit:
-                        worker_chain = config.chain_for(explicit)
-                        log("escalate", id=sid, note=f"explicit={explicit}")
-                    else:
-                        diff = (subtask.get("difficulty") or "T2").upper()
-                        new_diff = {"T1": "T2", "T2": "T3", "T3": "T3"}[diff]
-                        worker_chain = config.WORKER_TIERS[new_diff]
-                        log("escalate", id=sid, note=f"{diff}→{new_diff}")
+                    fix_decision = _orchestrator_decide_fix(
+                        subtask=subtask, worker_output=worker_out,
+                        validator_feedback=v_text, manifest=manifest,
+                        manifest_path=manifest_path, contract=contract,
+                        project_dir=project_dir, out_dir=out_dir,
+                        cache=cache, tracker=tracker, log=log,
+                    )
+                    # REPLAN with split_into → deprecated-by-split, outer loop
+                    # picks up the new fix child subtask cleanly.
+                    if subtask.get("status") == "deprecated-by-split":
+                        log("subtask-replaced-by-fix-feature", id=sid)
+                        break
+
+                    # DIRECTIVE → take it as the retry guidance
+                    if fix_decision and fix_decision.get("action") == "DIRECTIVE":
+                        last_reject_feedback = (
+                            f"{v_text}\n\n[Orchestrator directive after review]\n"
+                            f"{fix_decision.get('directive', '')}"
+                        )
+                    # If Orchestrator updated difficulty via REPLAN-in-place,
+                    # the manifest is already patched; refresh worker_chain.
+                    if subtask.get("difficulty"):
+                        worker_chain = config.worker_chain(subtask)
+                        log("escalate", id=sid,
+                            note=f"orchestrator-decided difficulty={subtask['difficulty']}")
 
                 # Build retry user prompt with the validator's reject reasoning
-                # interpolated. This (a) gives the next worker actionable
-                # feedback and (b) changes the cache key so we can't loop on a
-                # cached rejected output. use_cache=False is belt + suspenders.
+                # interpolated (+ Orchestrator directive if present).
                 retry_user = (
                     f"{worker_user}\n\n"
                     f"## Previous attempt was REJECTED — Validator feedback\n{last_reject_feedback}\n\n"
@@ -719,14 +840,18 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
                     cwd=str(project_dir), use_cache=False,
                 )
                 _save_artifact(out_dir, sid, f"worker.attempt{attempt + 1}", worker_out)
+                _apply_files_to_write(worker_out, project_dir, log, sid)
                 log("worker-retry-done", id=sid, attempt=attempt + 1,
                     provider=worker_used.name, model=worker_used.model)
                 attempt += 1
 
-            subtask["status"] = "done" if passed else "rework"
+            # Don't overwrite status if Orchestrator replaced this subtask
+            # with a fix-feature child (status="deprecated-by-split").
+            if subtask.get("status") != "deprecated-by-split":
+                subtask["status"] = "done" if passed else "rework"
             handoff = _extract_handoff(worker_out)
             _save_manifest(manifest_path, manifest)
-            if not passed:
+            if subtask.get("status") == "rework":
                 log("subtask-failed", id=sid, note="left as rework — manual intervention required")
                 rc = 2
                 break

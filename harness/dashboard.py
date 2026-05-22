@@ -163,29 +163,54 @@ def render_tasks(manifest: dict | None) -> Panel:
                      title="[bold]TASKS[/]", border_style="white")
     table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold",
                   expand=True, pad_edge=False, padding=(0, 1))
+    # Milestone column only shown when any subtask declares one.
+    has_milestones = any(s.get("milestone_id") for s in manifest.get("subtasks", []))
+    if has_milestones:
+        table.add_column("M", width=4)
     table.add_column("ID", width=6)
     table.add_column("Description", overflow="fold")
     table.add_column("Diff", width=4)
-    table.add_column("Profile", width=10)
-    table.add_column("Validator", width=4, justify="center")
+    table.add_column("Kind", width=10)
+    table.add_column("V", width=4, justify="center")
     table.add_column("Status")
 
+    # Group rows by milestone if any are defined
+    milestone_titles = {m["id"]: m.get("desc", "") for m in manifest.get("milestones", [])}
+    last_milestone = "__SENTINEL__"
     for sub in manifest.get("subtasks", []):
+        m_id = sub.get("milestone_id")
+        if has_milestones and m_id != last_milestone:
+            # insert a section header row
+            title = milestone_titles.get(m_id, "—") if m_id else "(none)"
+            table.add_row(
+                Text(m_id or "—", style="cyan bold"),
+                "",
+                Text(f"── {title} ──", style="cyan bold"),
+                "", "", "", "",
+            )
+            last_milestone = m_id
         status = sub.get("status", "todo")
         status_color = {
             "done": "green",
             "in-progress": "cyan bold",
             "rework": "yellow bold",
             "todo": "dim",
+            "deprecated-by-split": "dim",
         }.get(status, "white")
-        table.add_row(
+        kind = sub.get("validation_kind", "scrutiny" if sub.get("needs_validator") else "—")
+        # When milestones column is present we need an extra leading cell.
+        row_data = []
+        if has_milestones:
+            row_data.append("")  # milestone col stays blank on data rows
+        row_data.extend([
             sub.get("id", "?"),
             sub.get("desc", ""),
             sub.get("difficulty", ""),
-            sub.get("default_profile", ""),
+            kind,
             "✓" if sub.get("needs_validator") else "",
             Text(status, style=status_color),
-        )
+        ])
+        table.add_row(*row_data)
     return Panel(table, title="[bold]TASKS[/]", border_style="white")
 
 

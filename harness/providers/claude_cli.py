@@ -92,4 +92,5 @@ class ClaudeCLI(Provider):
             input_tokens=u.get("input_tokens", 0),
             output_tokens=u.get("output_tokens", 0),
             cached_input_tokens=u.get("cache_read_input_tokens", 0),
+            turns=payload.get("num_turns", 0),  # trajectory cap signal
         )

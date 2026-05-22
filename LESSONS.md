@@ -255,3 +255,27 @@ if sys.platform == "win32":
 4. **Token=0 是訊號不是噪音**:Claude 回 0/0 input/output 通常代表它沒真的進入 tool loop。如果 worker 宣稱 done 但 token=0,**幾乎必然**沒做事。
 
 5. **Validator 也是 Worker**(從 cwd 看 disk)— 不能假設 Validator 純基於 worker_output 文本判決。**給它 cwd**。
+
+---
+
+## v0.3 新增的觀察(從 Factory Missions 對齊得到的)
+
+### 16. 同 Worker 重試難以救自己,要換 context
+
+連續被 Validator reject 後,**讓 Orchestrator 拆 fix-feature 出來**(乾淨 context 的新 Worker)比讓原 Worker retry 有效。Factory 自己的數據:34.4% 工作是 fix features。
+
+### 17. Two-tier Validator 的盲區
+
+`scrutiny` validator(讀 code)抓不到 runtime bug(missing dependency、wrong endpoint、HTTP 500 in production)。對任何「會被使用者跑起來」的 artifact,**配 `validation_kind: "functional"`** —— Codex 帶著 cwd 真的 `curl` / `python -m pytest` 才會發現。
+
+### 18. Trajectory turn count 是早期 stuck 警報
+
+Claude `num_turns` / Codex `turn.completed` 計數 / Minimax 我們自己數的 tool loop 輪數。Cap 設 80(Factory median 51),超過幾乎一定是 stuck loop。**比 timeout 早 5-10 分鐘觸發**,省 token + 早期介入。
+
+### 19. Skill library 不靠魔法,靠紀律
+
+`~/.mission/skills/` 目前是手動 curate + keyword search。**先別追自動萃取**,先確保每次踩坑後手動寫一條(像本文件 #1-15 一樣)。一年後累積 50+ 條,任何新 mission 都自動帶上歷史教訓。
+
+### 20. Test-first 不是 ideology,是反「為了過 test 改 test」
+
+Worker SOUL 強制 `FILES_TO_WRITE` 內測試檔在前、實作檔在後。順序定義意圖(by behavior)而非結果(by code)。後者會出現「測試剛好對應 implementation 細節 → 用 mock 過 test → 真實 user 行為失敗」的反向操作。

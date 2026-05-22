@@ -175,7 +175,9 @@ class MinimaxToken(Provider):
 
         last_payload: dict = {}
         total_in = total_out = 0
+        turns = 0
         for _round in range(self.MAX_TOOL_ROUNDS):
+            turns += 1
             payload = self._post_chat(messages, max_tokens=max_tokens, tools=tools)
             last_payload = payload
             usage_data = payload.get("usage", {}) or {}
@@ -192,7 +194,7 @@ class MinimaxToken(Provider):
                 return CompletionResult(
                     text=_strip_think(content),
                     provider=self.name, model=self.model,
-                    usage=Usage(input_tokens=total_in, output_tokens=total_out),
+                    usage=Usage(input_tokens=total_in, output_tokens=total_out, turns=turns),
                     raw=payload,
                 )
 

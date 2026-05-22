@@ -72,6 +72,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="provider/model key, e.g. claude-cli/claude-opus-4-7 (omit = all)")
     _add_project_arg(p_reset)
 
+    p_skills = sub.add_parser("skills", help="manage the skill library (~/.mission/skills/)")
+    skills_sub = p_skills.add_subparsers(dest="skills_cmd")
+    skills_sub.add_parser("list", help="list installed skills")
+    p_skills_install = skills_sub.add_parser("install-seeds",
+                                             help="copy bundled seed skills into ~/.mission/skills/")
+
     args = parser.parse_args(argv)
 
     if args.cmd is None:
@@ -115,6 +121,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "reset":
         from . import runner
         return runner.cmd_reset(args.project, args.target)
+
+    if args.cmd == "skills":
+        from . import skills as _skills
+        import shutil
+        if args.skills_cmd == "list" or not args.skills_cmd:
+            files = _skills.list_skills()
+            if not files:
+                print("(no skills installed — try `mission skills install-seeds`)")
+            else:
+                for f in files:
+                    print(f"  {f.stem:<35}  {f.stat().st_size:>6} bytes")
+            return 0
+        if args.skills_cmd == "install-seeds":
+            seeds_dir = Path(__file__).parent / "skills_seed"
+            target = _skills.skills_dir()
+            count = 0
+            for seed in seeds_dir.glob("*.md"):
+                dst = target / seed.name
+                if dst.exists():
+                    print(f"  [SKIP] {seed.name} (already exists)")
+                    continue
+                shutil.copy2(seed, dst)
+                print(f"  [INSTALL] {seed.name}")
+                count += 1
+            print(f"\n{count} seed(s) installed at {target}")
+            return 0
 
     parser.print_help()
     return 1

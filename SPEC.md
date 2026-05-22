@@ -1,7 +1,9 @@
 # mission-framework — Specification
 
 > 這份文件是經過實戰驗證的規格,涵蓋路由模型、provider 行為、escalation 協議、安全網與已知陷阱。
-> 第一次跑這個框架的人讀這份就夠;深入細節讀 [DESIGN.md](DESIGN.md);採坑紀錄讀 [LESSONS.md](LESSONS.md)。
+> 第一次跑這個框架的人讀這份就夠;深入細節讀 [DESIGN.md](DESIGN.md);採坑紀錄讀 [LESSONS.md](LESSONS.md);改版紀錄讀 [CHANGELOG.md](CHANGELOG.md)。
+>
+> **v0.3.0(本版)新增**:two-tier Validator(scrutiny + functional)、fix-features 模式、test-first 紀律、trajectory caps、milestones 階層、skill library、Mission Control UI。設計向 Factory Missions 對齊。
 
 ---
 
@@ -185,6 +187,39 @@ Runner 接到 → 呼叫 Orchestrator (Opus) → 回應其一:
 
 Validator 必須在 **cwd=project_dir** 下執行(從 disk 看 Worker 寫的真實檔案)。
 
+### Two-tier Validators(v0.3 新增)
+
+每個 subtask 可選 `validation_kind`:
+
+| `validation_kind` | 行為 | 適用 |
+|---|---|---|
+| `scrutiny`(預設) | 讀 code、對照 AC、找隱藏假設 / 邊界 case | 純程式邏輯 |
+| `functional` | 用 Bash 工具**真的執行**系統(`curl` / `python` / `pytest`)觀察輸出 | UI / API / 服務、契約有可執行驗證的任務 |
+
+SOUL 各自獨立 —— [`validator-functional.md`](harness/souls/validator-functional.md) 明確指示「不要讀 code 下判決,實際跑」。
+
+### Fix-features pattern(v0.3 新增)
+
+Validator reject 2 次後,**不再盲目升難度重試**,改呼 Orchestrator(Opus)決定:
+- **DIRECTIVE** —— 一段精準指令給下次 Worker
+- **REPLAN with `split_into`** —— 拆出 `T-XX-fix` 乾淨 context 子任務
+
+依據 Factory Missions 原則:「Validator 只指出問題,Orchestrator 排程修法」 —— 同一個失敗 context 的 Worker 不適合自己救自己。
+
+## 7a. Trajectory caps(v0.3 新增)
+
+每個 role 的 agent-loop turn 上限:
+
+```python
+TURN_CAPS = {
+    "worker": 80,
+    "validator": 50,
+    "orchestrator": 30,
+}
+```
+
+超過 → 紀錄 `trajectory-cap-exceeded` 事件(早期偵測 stuck workers,Factory reference 數據:median 51 turns / impl)。
+
 ---
 
 ## 8. 失效模式 → 自動處理
@@ -247,6 +282,37 @@ T-06 (T1) Minimax  → README + start.bat
 驗證後啟動:`python backend/app.py --port 19002`,瀏覽器開 `http://127.0.0.1:19002`,看到 1280×720 像素辦公室即時 poll 框架自己的狀態。
 
 ---
+
+## 10a. Skill Library(v0.3 新增)
+
+`~/.mission/skills/` 內每個 `.md` 檔是一條可重用 pattern。Orchestrator 與 Worker 啟動時自動 keyword-search 相關 skills 注入 prompt。
+
+CLI:
+```bash
+mission skills list             # 列已安裝
+mission skills install-seeds    # 裝 framework 內建的 seed skills
+```
+
+內建 seeds(`harness/skills_seed/`):
+- `claude-cli-headless.md` —— Claude headless 正確 invocation
+- `minimax-tool-calling.md` —— OpenAI 標準 tool calling
+- `flask-stdlib-json-server.md` —— dashboard backend pattern
+
+寫新 skill 直接放進 `~/.mission/skills/`,下次 mission 自動受益。
+
+## 10b. Milestones 階層(v0.3 新增)
+
+長 mission(> 8 subtasks)可用 milestones 分組:
+
+```json
+{
+  "mission": "...",
+  "milestones": [{"id": "M1", "desc": "..."}],
+  "subtasks": [{"id": "T-01", "milestone_id": "M1", ...}]
+}
+```
+
+Dashboard 自動畫 milestone section header。短 mission 不用標,向後相容。
 
 ## 11. 寫新 mission 的 checklist
 

@@ -13,6 +13,7 @@ class Usage:
     output_tokens: int = 0
     cached_input_tokens: int = 0
     invocations: int = 1  # always 1 per call; lets you budget by call-count
+    turns: int = 0  # agent-loop turn count (for trajectory cap enforcement)
 
 
 @dataclass

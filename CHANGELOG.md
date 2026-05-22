@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.3.0 — Factory Missions alignment (2026-05-23)
+
+Adopted 8 patterns from Factory.ai's Missions architecture after researching their public documentation. None changed the core 3-role design but each closed a gap or unlocked new task shapes.
+
+### Added
+
+- **Two-tier Validator** (`#1` + `#8`) — `validation_kind: "scrutiny" | "functional"` on each subtask. `functional` validators **actually run the system** (Bash + curl + pytest) instead of only reading code. New SOUL [`validator-functional.md`](harness/souls/validator-functional.md) and template [`6-validator-functional.md`](harness/prompts/6-validator-functional.md).
+- **Fix-features pattern** (`#2`) — On the 2nd Validator reject, runner calls the Orchestrator (Opus) to either issue a precise DIRECTIVE for one more retry OR REPLAN with `split_into` → spawn a clean-context fix subtask. Replaces the old "blindly bump difficulty tier" path. Based on Factory's "validators surface, Orchestrator schedules fixes" rule.
+- **Test-first discipline** (`#3`) — Worker SOUL explicitly requires tests in `FILES_TO_WRITE` before implementation files. Prevents post-hoc test rationalization.
+- **Trajectory length caps** (`#4`) — `TURN_CAPS` per role (worker 80 / validator 50 / orchestrator 30). Providers now report `turns` in `Usage`. Runner emits `trajectory-cap-exceeded` event when an agent loop runs longer than expected — useful early-warning signal for stuck workers.
+- **Milestones → Features hierarchy** (`#5`) — Optional `manifest.milestones` array + `subtask.milestone_id`. Backward compatible. Dashboard renders section headers grouping subtasks by milestone.
+- **Skill library** (`#6`) — `~/.mission/skills/` directory of reusable markdown skills. Orchestrator/Worker prompts auto-inject relevant skills via keyword search. Seeded with `claude-cli-headless.md`, `minimax-tool-calling.md`, `flask-stdlib-json-server.md`. New `mission skills list` / `mission skills install-seeds` commands.
+- **Mission Control UI** (`#7`) — Textual console now uses a 3-column control row: TASKS / latest VALIDATOR artifact / EVENTS — side-by-side instead of stacked. Inspired by Factory's Mission Control layout.
+
+### Changed
+
+- `_build_system(role, mode=...)` now supports `validator/functional` mode.
+- `_call_with_failover()` logs `trajectory` (or `trajectory-cap-exceeded`) for every call with non-zero turn count.
+- Worker SOUL: explicit "tests before impl" rule + Factory citation.
+- Orchestrator prompt template now describes optional `milestones` schema.
+
+### Fixed
+
+- After REPLAN `split_into`, runner no longer overwrites `deprecated-by-split` status with `done`/`rework`.
+
+### Not adopted (deliberate)
+
+- **Computer-use validator** (clicking UI, visual diff) — needs Playwright/etc; functional validator (Bash + curl) covers most use cases.
+- **Droid Shield secret scanning** — OAuth/subscription model has lower key-leak surface.
+- **OpenTelemetry pipeline** — `run.log.jsonl` already gives structured events.
+
+See [SPEC.md](SPEC.md) §2-7 for the updated contract surface and [LESSONS.md](LESSONS.md) for the bug-hunt history that informed these designs.
+
+---
+
 ## 0.2.0 — First fully working mission (2026-05-23)
 
 ### Milestone

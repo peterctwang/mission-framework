@@ -162,17 +162,22 @@ class ConsoleApp(App):
     CSS = """
     Screen { background: $surface; }
 
-    #top { height: 12; }
+    /* Top strip: mission summary + providers */
+    #top { height: 11; }
     #top > Container { border: round $primary; }
+    #mission-pane { width: 38%; }
+    #providers-pane { width: 62%; }
 
-    #mission-pane { width: 40%; }
-    #providers-pane { width: 60%; }
-
-    #tasks-pane { border: round $secondary; height: 1fr; }
-    #events-pane { border: round $warning; height: 16; }
+    /* Mission Control split:
+       Left  = TASKS list (feature/subtask table)
+       Mid   = latest VALIDATOR artifact (full content)
+       Right = EVENT stream */
+    #control-row { height: 1fr; }
+    #tasks-pane     { border: round $secondary; width: 38%; }
+    #validator-pane { border: round $success;   width: 32%; }
+    #events-pane    { border: round $warning;   width: 30%; }
 
     .pane-title { background: $primary 40%; color: $text; padding: 0 1; }
-
     DataTable > .datatable--header { background: $primary 30%; }
     """
 
@@ -193,6 +198,7 @@ class ConsoleApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        # Top strip — Mission summary + Providers
         with Horizontal(id="top"):
             with Container(id="mission-pane"):
                 yield Static("MISSION", classes="pane-title")
@@ -200,12 +206,17 @@ class ConsoleApp(App):
             with Container(id="providers-pane"):
                 yield Static("PROVIDERS", classes="pane-title")
                 yield DataTable(id="providers-table", show_cursor=False)
-        with Container(id="tasks-pane"):
-            yield Static("TASKS", classes="pane-title")
-            yield DataTable(id="tasks-table", show_cursor=False)
-        with Container(id="events-pane"):
-            yield Static("EVENTS (latest)", classes="pane-title")
-            yield RichLog(id="events-log", highlight=True, wrap=False, markup=True, auto_scroll=True)
+        # Mission Control row — Tasks / Validator artifact / Events
+        with Horizontal(id="control-row"):
+            with Container(id="tasks-pane"):
+                yield Static("TASKS", classes="pane-title")
+                yield DataTable(id="tasks-table", show_cursor=False)
+            with Container(id="validator-pane"):
+                yield Static("LATEST VALIDATOR OUTPUT", classes="pane-title")
+                yield RichLog(id="validator-log", highlight=True, wrap=True, markup=False, auto_scroll=False)
+            with Container(id="events-pane"):
+                yield Static("EVENTS", classes="pane-title")
+                yield RichLog(id="events-log", highlight=True, wrap=False, markup=True, auto_scroll=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -228,6 +239,32 @@ class ConsoleApp(App):
         self._refresh_providers()
         self._refresh_tasks()
         self._refresh_events()
+        self._refresh_validator()
+
+    def _refresh_validator(self) -> None:
+        """Show the most recent validator artifact's content."""
+        artifacts = self.project / "artifacts"
+        if not artifacts.exists():
+            return
+        validator_files = sorted(
+            artifacts.glob("*.validator.*.md"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        log = self.query_one("#validator-log", RichLog)
+        if not validator_files:
+            return
+        latest = validator_files[0]
+        # Track which one is shown so we don't redraw constantly.
+        if getattr(self, "_shown_validator", None) == latest:
+            return
+        self._shown_validator = latest
+        log.clear()
+        log.write(f"== {latest.name} ==\n")
+        body = latest.read_text(encoding="utf-8")
+        # Cap to keep render cheap
+        for line in body.splitlines()[:200]:
+            log.write(line)
 
     def _refresh_mission(self) -> None:
         m = _read_manifest(self.project)

@@ -83,8 +83,9 @@ class CodexCLI(Provider):
 
     @staticmethod
     def _extract_usage(jsonl: str) -> Usage:
-        """codex --json emits a `turn.completed` event with usage block."""
-        total = Usage(input_tokens=0, output_tokens=0, cached_input_tokens=0)
+        """codex --json emits a `turn.completed` event with usage block.
+        Each `turn.completed` is one trajectory turn — count them."""
+        total = Usage(input_tokens=0, output_tokens=0, cached_input_tokens=0, turns=0)
         for line in jsonl.splitlines():
             line = line.strip()
             if not line:
@@ -98,4 +99,5 @@ class CodexCLI(Provider):
                 total.input_tokens += u.get("input_tokens", 0)
                 total.output_tokens += u.get("output_tokens", 0)
                 total.cached_input_tokens += u.get("cached_input_tokens", 0)
+                total.turns += 1
         return total
