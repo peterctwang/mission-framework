@@ -973,6 +973,222 @@ def _extract_handoff(worker_text: str) -> str:
     return chunk
 
 
+# ── Mission Ledger — structured cross-subtask memory ──────────────────────
+#
+# A 200-word free-text handoff is too thin for long missions (50+ subtasks,
+# 4+ hours). By subtask #20 the worker has no idea what subtask #5 decided.
+#
+# The ledger is an append-only JSON record persisted to out_dir/ledger.json
+# after every subtask completion. Each entry captures structured fields
+# parsed from the worker's `## Handoff` section:
+#
+#   { id, ts, files_touched: [paths], invariants: [str], decisions: [str],
+#     narrative: str }
+#
+# When building the next worker's prompt, we don't replay all narratives —
+# instead we surface:
+#   • the FULL last 2 subtasks (recent context)
+#   • the deduplicated invariant list (long-term commitments)
+#   • a files-touched index (path → which subtask introduced it)
+#
+# This means subtask #50 sees "subtask #5 established that
+# `PROVIDER_KEYS must contain claude-cli/codex-cli/gemini-cli/minimax-token`"
+# even though there's no room to replay subtask #5's full output.
+#
+# Resume-friendly: if a mission gets killed mid-run, ledger.json on disk
+# preserves cumulative state, so the next `mission run` rebuilds the
+# context as if no interruption happened.
+
+# Section headers the parser recognises inside ## Handoff. Case-insensitive,
+# the worker SOUL prompts for these exact names but we tolerate variants.
+_HANDOFF_SECTION_RE = re.compile(
+    r"^###\s+(Files\s+touched|Invariants|Decisions|Narrative)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+LEDGER_RECENT_NARRATIVE_COUNT = 2
+LEDGER_INVARIANT_HARD_CAP = 30  # don't let it grow unbounded across 100+ subtasks
+LEDGER_FILES_INDEX_CAP = 40
+
+
+def _parse_structured_handoff(worker_text: str) -> dict:
+    """Parse `## Handoff` body into structured fields.
+
+    Expected (loose) shape:
+        ## Handoff
+        ### Files touched
+        - frontend/game.js
+        - backend/app.py
+        ### Invariants
+        - LAYOUT.providers must contain all 4 keys
+        ### Decisions
+        - Used Phaser graphics over text for performance
+        ### Narrative
+        Brief free-text recap (<80 words).
+
+    Missing sections degrade gracefully — narrative falls back to last
+    30 lines if no `## Handoff` block at all.
+    """
+    text = worker_text or ""
+    if "## Handoff" in text:
+        body = text.split("## Handoff", 1)[1]
+    else:
+        body = "\n".join(text.strip().splitlines()[-30:])
+        return {
+            "files_touched": [],
+            "invariants": [],
+            "decisions": [],
+            "narrative": body[:1000],
+        }
+
+    sections: dict[str, list[str]] = {"files_touched": [], "invariants": [],
+                                       "decisions": [], "narrative": []}
+    cur = "narrative"
+    for line in body.splitlines():
+        m = _HANDOFF_SECTION_RE.match(line)
+        if m:
+            name = m.group(1).lower().replace(" ", "_")
+            cur = {"files_touched": "files_touched", "invariants": "invariants",
+                   "decisions": "decisions", "narrative": "narrative"}.get(name, "narrative")
+            continue
+        # Stop if we hit the next H2 (some other top-level section).
+        if line.startswith("## ") and not line.startswith("## Handoff"):
+            break
+        sections[cur].append(line)
+
+    def _items(lines: list[str]) -> list[str]:
+        out = []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                continue
+            # Bullet markers
+            if s.startswith(("-", "*", "•")):
+                s = s.lstrip("-*• ").strip()
+            if s:
+                out.append(s[:300])  # individual item cap
+        return out
+
+    narrative_text = "\n".join(sections["narrative"]).strip()
+    if len(narrative_text) > 800:
+        narrative_text = narrative_text[:800].rstrip() + " …[truncated]"
+
+    return {
+        "files_touched": _items(sections["files_touched"])[:20],
+        "invariants":    _items(sections["invariants"])[:15],
+        "decisions":     _items(sections["decisions"])[:10],
+        "narrative":     narrative_text,
+    }
+
+
+class MissionLedger:
+    """Append-only cross-subtask memory persisted to ledger.json.
+
+    Long-mission survivor: on resume, load_or_new(out_dir) reconstructs
+    cumulative state from disk so the worker prompt looks identical
+    whether the mission started fresh or resumed after a crash.
+    """
+
+    def __init__(self, out_dir: Path):
+        self.path = out_dir / "ledger.json"
+        self.entries: list[dict] = []
+
+    @classmethod
+    def load_or_new(cls, out_dir: Path) -> "MissionLedger":
+        led = cls(out_dir)
+        if led.path.exists():
+            try:
+                led.entries = json.loads(led.path.read_text(encoding="utf-8"))
+                if not isinstance(led.entries, list):
+                    led.entries = []
+            except (json.JSONDecodeError, OSError):
+                led.entries = []
+        return led
+
+    def record(self, subtask_id: str, worker_text: str) -> dict:
+        parsed = _parse_structured_handoff(worker_text)
+        entry = {
+            "id": subtask_id,
+            "ts": _now(),
+            **parsed,
+        }
+        self.entries.append(entry)
+        self._persist()
+        return entry
+
+    def _persist(self) -> None:
+        try:
+            _atomic_write(self.path, json.dumps(self.entries, indent=2, ensure_ascii=False))
+        except OSError:
+            # Ledger is observability — never fail the mission over it.
+            pass
+
+    def aggregate_invariants(self) -> list[str]:
+        """Deduplicated invariants across all subtasks, most-recent first.
+        Capped so it doesn't bloat the worker prompt on 100+ subtask runs."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for entry in reversed(self.entries):
+            for inv in entry.get("invariants", []):
+                key = inv.lower().strip()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(inv)
+                if len(out) >= LEDGER_INVARIANT_HARD_CAP:
+                    return out
+        return out
+
+    def files_index(self) -> list[tuple[str, str]]:
+        """[(path, last-subtask-that-touched-it)] up to a cap."""
+        idx: dict[str, str] = {}
+        for entry in self.entries:
+            for f in entry.get("files_touched", []):
+                idx[f] = entry["id"]   # later overwrites earlier
+        items = list(idx.items())
+        # Most-recently-touched first
+        items.sort(key=lambda kv: next(
+            (i for i, e in enumerate(reversed(self.entries))
+             if kv[0] in e.get("files_touched", [])),
+            10**9,
+        ))
+        return items[:LEDGER_FILES_INDEX_CAP]
+
+    def recent_narratives(self, n: int = LEDGER_RECENT_NARRATIVE_COUNT) -> list[dict]:
+        """Last n entries' (id, narrative) — full text for proximate context."""
+        return self.entries[-n:] if self.entries else []
+
+    def as_worker_context(self) -> str:
+        """Render the ledger as a section for the worker prompt.
+
+        Returns empty string if there's nothing yet (first subtask).
+        """
+        if not self.entries:
+            return ""
+        parts: list[str] = []
+        parts.append("## Mission ledger (cumulative cross-subtask memory)")
+        invs = self.aggregate_invariants()
+        if invs:
+            parts.append("\n### Invariants established by prior subtasks (must respect)")
+            for inv in invs:
+                parts.append(f"- {inv}")
+        files = self.files_index()
+        if files:
+            parts.append("\n### Files touched so far")
+            for path, sid in files:
+                parts.append(f"- `{path}` (last touched by {sid})")
+        narratives = self.recent_narratives()
+        if narratives:
+            parts.append(f"\n### Recent subtask handoffs (last {len(narratives)})")
+            for e in narratives:
+                hdr = f"#### {e['id']}"
+                parts.append(hdr)
+                if e.get("decisions"):
+                    parts.append("**Decisions:** " + "; ".join(e["decisions"][:5]))
+                if e.get("narrative"):
+                    parts.append(e["narrative"])
+        return "\n".join(parts).strip()
+
+
 _log_lock = threading.Lock()
 
 
@@ -1097,6 +1313,10 @@ def run(manifest_path: Path, contract_path: Path | None,
               f"{kwargs.get('note') or kwargs.get('reason') or ''}", file=sys.stderr)
 
     handoff = ""
+    # Mission ledger — cumulative cross-subtask memory survives crashes.
+    # If ledger.json exists from a prior interrupted run, we resume with
+    # full context (invariants, files touched, recent narratives).
+    ledger = MissionLedger.load_or_new(out_dir)
     rc = 0
     _provider_fail_count.clear()
     # PID lock — refuse to run if another mission is alive on this project.
@@ -1131,11 +1351,13 @@ def run(manifest_path: Path, contract_path: Path | None,
             skill_ctx = _skills.load_skills_for_mission(
                 subtask.get("desc", "") + " " + manifest.get("mission", ""),
             )
+            ledger_ctx = ledger.as_worker_context()
             worker_user = (
                 f"## Current subtask\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
                 f"## Relevant validation contract items\n{ac_excerpt}\n\n"
                 + (f"{skill_ctx}\n\n" if skill_ctx else "")
-                + f"## Previous handoff\n{handoff or '(none — first subtask)'}\n"
+                + (f"{ledger_ctx}\n\n" if ledger_ctx else "")
+                + f"## Previous handoff (most recent — full text)\n{handoff or '(none — first subtask)'}\n"
             )
 
             # Worker chain is now picked by SUBTASK DIFFICULTY (T1/T2/T3),
@@ -1278,6 +1500,7 @@ def run(manifest_path: Path, contract_path: Path | None,
             if not subtask.get("needs_validator", False):
                 subtask["status"] = "done"
                 handoff = _extract_handoff(worker_out)
+                ledger.record(sid, worker_out)
                 _save_manifest(manifest_path, manifest)
                 continue
 
@@ -1396,6 +1619,10 @@ def run(manifest_path: Path, contract_path: Path | None,
                 else:
                     subtask["status"] = "rework"
             handoff = _extract_handoff(worker_out)
+            # Record into ledger only on success — rework/failed entries
+            # would pollute future subtask context with broken state.
+            if subtask.get("status") == "done":
+                ledger.record(sid, worker_out)
             _save_manifest(manifest_path, manifest)
             if subtask.get("status") == "rework":
                 note = "wall-time exceeded" if timed_out else "left as rework — manual intervention required"

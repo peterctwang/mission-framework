@@ -34,11 +34,25 @@
 (每個建立/修改的檔案都要列;這是 runner safety net,即使你已用 Write 工具寫了也要列)
 
 ## Handoff
-1. 完成了什麼(一句話)
-2. 改了哪些檔案
-3. 給下一個 Worker 的提醒
-(≤ 200 字)
+### Files touched
+- relative/path/to/file1
+- relative/path/to/file2
+
+### Invariants
+- 後續 subtask **必須** respect 的事實(e.g. `LAYOUT.providers 必須含 4 個 key: claude-cli / codex-cli / gemini-cli / minimax-token`)
+- 通常是新建的 constant / function signature / 共用變數名 / config schema
+- 寫成「X 必須 Y」格式,後續 worker 會把這當合約看
+- 沒有就寫 `- (none)`
+
+### Decisions
+- 關鍵實作選擇 + 為什麼(≤ 1 行/條)
+- e.g. `用 Phaser graphics 而非 sprite 畫 HUD,效能考量`
+
+### Narrative
+做了什麼的一段話(≤ 80 字),給下一條 subtask 看的提醒。
 ```
+
+⚠️ 結構化 Handoff 是長 mission 的命脈 —— 後續 subtask **看不到你的完整輸出**,只看到這個區塊 + 你列的 Invariants。Invariants 寫不清楚 = 後面會踩你的坑。
 
 ## 升級給 Orchestrator(只在卡住時)
 
