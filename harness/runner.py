@@ -77,7 +77,7 @@ LOCK_STALE_AFTER_S = 60     # 3× heartbeat — orphan if lock not touched
 PROVIDER_FAIL_LIMIT = 3     # circuit breaker: N consecutive transient errors → disable
 DEFAULT_TOKEN_CAP_PER_MISSION = 10_000_000  # hard cap; overridable via --max-tokens
 PARALLEL_MAX_WORKERS = 4   # ThreadPoolExecutor size for parallel subtasks
-PARALLEL_RETRY_CAP = 2     # after N parallel failures, downgrade to serial
+PARALLEL_RETRY_CAP = 3     # after N parallel failures, downgrade to serial
 _heartbeat_stop = threading.Event()
 _lock_path: Path | None = None
 
