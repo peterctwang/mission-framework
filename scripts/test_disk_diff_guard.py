@@ -71,6 +71,31 @@ class TestSnapshot(unittest.TestCase):
             snap = _snapshot_workspace(d)
             self.assertNotIn("binary.png", snap)
 
+    def test_skips_mission_control_files(self):
+        """manifest*.json / contract*.md / .harness* / artifacts/ MUST NOT
+        be snapshotted — they self-poison the disk-diff guard with literal
+        strings that look like worker stubs (e.g. a contract saying
+        'no ...existing config...' would self-trigger the marker check)."""
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            stub_text = "// ...existing config...\n" + "x\n" * 50
+            for fname in ("manifest-v1.json", "manifest.json",
+                          "contract-foo.md", "contract.md",
+                          "ledger.json", "run.log.jsonl",
+                          ".harness-state.json", ".harness.lock"):
+                _write(d / fname, stub_text)
+            _write(d / "artifacts" / "T-01.worker.md", stub_text)
+            snap = _snapshot_workspace(d)
+            tracked = set(snap.keys())
+            self.assertFalse(any("manifest" in t for t in tracked),
+                             f"manifest leaked into snapshot: {tracked}")
+            self.assertFalse(any("contract" in t for t in tracked),
+                             f"contract leaked into snapshot: {tracked}")
+            self.assertNotIn("ledger.json", tracked)
+            self.assertNotIn("run.log.jsonl", tracked)
+            self.assertFalse(any("artifacts/" in t for t in tracked),
+                             f"artifacts/ leaked: {tracked}")
+
 
 class TestRegression(unittest.TestCase):
     """The guard must fire on the Minimax/Gemini failure patterns we hit."""

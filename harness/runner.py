@@ -416,14 +416,15 @@ def _snapshot_workspace(project_dir: Path) -> dict[str, dict]:
             continue
         if p.suffix.lower() not in _SNAPSHOT_EXTS:
             continue
-        # Don't snapshot mission-control files (manifest / state / ledger /
-        # log). Workers should never touch these — the _apply_files_to_write
-        # guard already blocks them. Snapshotting them creates noisy false
-        # positives when the runner itself mutates them during the worker run.
+        # Don't snapshot mission-control files. Workers shouldn't touch
+        # these AND they often contain literal strings that match disk-diff
+        # markers (e.g. a contract.md saying "no '...existing config...'"
+        # would self-trigger the stub-placeholder check).
         _name = p.name
         if (_name in ("ledger.json", ".harness-state.json", "run.log.jsonl",
                       ".harness.lock")
                 or (_name.startswith("manifest") and _name.endswith(".json"))
+                or (_name.startswith("contract") and _name.endswith(".md"))
                 or _name.startswith(".harness")):
             continue
         try:
@@ -564,13 +565,15 @@ def _apply_files_to_write(worker_output: str, project_dir: Path,
             log("files-skip-unsafe", id=subtask_id, path=clean_path)
             continue
         # Mission-control files — workers must never touch these.
-        # manifest*.json / .harness-state.json / .harness.lock / run.log.jsonl /
-        # ledger.json all belong to the runner, not the worker.
+        # manifest*.json / contract*.md / .harness-state.json / .harness.lock /
+        # run.log.jsonl / ledger.json all belong to the runner & user, not
+        # the worker.
         _name = Path(clean_path).name
         _MISSION_CONTROL = ("run.log.jsonl", ".harness.lock", ".harness-state.json",
                             "ledger.json")
         if (_name in _MISSION_CONTROL
                 or (_name.startswith("manifest") and _name.endswith(".json"))
+                or (_name.startswith("contract") and _name.endswith(".md"))
                 or _name.startswith(".harness")):
             log("files-skip-mission-control", id=subtask_id, path=clean_path,
                 note="worker tried to overwrite runner-owned file — blocked")
@@ -1455,6 +1458,11 @@ def run(manifest_path: Path, contract_path: Path | None,
     out_dir = project_dir / "artifacts"
     cache = ResponseCache(project_dir / ".cache")
     tracker = QuotaTracker.load(project_dir / ".harness-state.json", budgets=config.BUDGETS)
+    # Snapshot at mission start so the token-cap check counts ONLY this
+    # mission's spend, not lifetime cumulative usage across prior missions.
+    _tokens_at_mission_start = sum(
+        st.tokens_in + st.tokens_out for st in tracker.providers.values()
+    )
     log_fp = (project_dir / "run.log.jsonl").open("a", encoding="utf-8")
     # Expose to heartbeat thread so it can emit liveness events.
     global _log_fp_ref
@@ -1547,12 +1555,16 @@ def run(manifest_path: Path, contract_path: Path | None,
                 continue
             # SERIAL PATH ───── (single subtask; existing full flow) ──────
             subtask = batch[0]
-            # Hard token cap — abort cleanly if mission has consumed beyond budget.
-            total_tokens = sum(
+            # Hard token cap — per-mission, not lifetime. Counts spend since
+            # this mission's run() entry, ignoring accumulated state from
+            # prior missions in the same project.
+            total_now = sum(
                 st.tokens_in + st.tokens_out for st in tracker.providers.values()
             )
-            if total_tokens > max_tokens:
-                log("mission-token-cap-exceeded", note=f"{total_tokens} > {max_tokens}")
+            mission_tokens = total_now - _tokens_at_mission_start
+            if mission_tokens > max_tokens:
+                log("mission-token-cap-exceeded",
+                    note=f"{mission_tokens} > {max_tokens} (this mission; lifetime={total_now})")
                 rc = 3
                 break
             sid = subtask["id"]
