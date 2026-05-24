@@ -66,11 +66,18 @@ def main(argv: list[str] | None = None) -> int:
 
     p_status = sub.add_parser("status", help="show provider quota state")
     _add_project_arg(p_status)
+    p_status.add_argument("--detailed", action="store_true",
+                          help="also show event counts from run.log.jsonl")
 
     p_reset = sub.add_parser("reset", help="reset quota for one or all providers")
     p_reset.add_argument("target", nargs="?", default=None,
                          help="provider/model key, e.g. claude-cli/claude-opus-4-7 (omit = all)")
     _add_project_arg(p_reset)
+
+    p_resume = sub.add_parser("resume", help="diagnose project state + offer resume options")
+    _add_project_arg(p_resume)
+    p_resume.add_argument("--clean-lock", action="store_true",
+                          help="force-remove .harness.lock (use only when sure no runner is alive)")
 
     p_skills = sub.add_parser("skills", help="manage the skill library (~/.mission/skills/)")
     skills_sub = p_skills.add_subparsers(dest="skills_cmd")
@@ -116,11 +123,57 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "status":
         from . import runner
-        return runner.cmd_status(args.project)
+        return runner.cmd_status(args.project, detailed=getattr(args, "detailed", False))
 
     if args.cmd == "reset":
         from . import runner
         return runner.cmd_reset(args.project, args.target)
+
+    if args.cmd == "resume":
+        from rich.console import Console
+        import time as _time
+        console = Console()
+        lock = args.project / ".harness.lock"
+        manifest_path = args.project / "manifest.json"
+        # try common manifest names
+        if not manifest_path.exists():
+            candidates = sorted(args.project.glob("manifest*.json"),
+                                key=lambda p: p.stat().st_mtime, reverse=True)
+            manifest_path = candidates[0] if candidates else None
+        console.rule("[bold]Mission Resume Diagnostic[/]")
+        if lock.exists():
+            content = lock.read_text(encoding="utf-8").strip().splitlines()
+            try:
+                pid, t = int(content[0]), float(content[1])
+                age = _time.time() - t
+                console.print(f"[yellow]Lock present[/]: PID {pid}, last heartbeat {age:.0f}s ago")
+                if age > 60:
+                    console.print("  → likely stale (heartbeat > 60s); safe to --clean-lock")
+                else:
+                    console.print("  → likely alive runner; check Task Manager for PID")
+            except Exception:
+                console.print("[red]Lock file unparseable[/]")
+            if args.clean_lock:
+                lock.unlink()
+                console.print("[green]Removed lock file[/]")
+        else:
+            console.print("[green]No lock — safe to start new mission[/]")
+        if manifest_path:
+            import json as _json
+            try:
+                m = _json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+                console.print(f"\n[bold]Manifest:[/] {manifest_path.name}")
+                counts = {"done": 0, "in-progress": 0, "rework": 0, "todo": 0, "deprecated-by-split": 0}
+                for s in m.get("subtasks", []):
+                    counts[s.get("status", "todo")] = counts.get(s.get("status", "todo"), 0) + 1
+                    console.print(f"  {s['id']:14s}  {s.get('status', '?')}")
+                console.print(f"\n  totals: {counts}")
+                if counts.get("in-progress", 0) > 0:
+                    console.print("\n[yellow]One or more subtasks left 'in-progress' (likely killed mid-run).[/]")
+                    console.print("Resume by re-running `mission run <manifest>` — those will re-execute from scratch.")
+            except Exception as e:
+                console.print(f"[red]Could not parse manifest: {e}[/]")
+        return 0
 
     if args.cmd == "skills":
         from . import skills as _skills

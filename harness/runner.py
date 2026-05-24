@@ -32,6 +32,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -71,8 +72,11 @@ HANDOFF_WORD_CAP = 200
 # process and reap. The heartbeat thread writes a single line to stderr every
 # 30s so the parent is visibly alive AND touches the PID lock so other runners
 # know we're still here.
-HEARTBEAT_INTERVAL_S = 30
-LOCK_STALE_AFTER_S = 90   # if lock hasn't been touched in 90s, treat as orphan
+HEARTBEAT_INTERVAL_S = 20   # << 60s reaper threshold for margin
+LOCK_STALE_AFTER_S = 60     # 3× heartbeat — orphan if lock not touched
+PROVIDER_FAIL_LIMIT = 3     # circuit breaker: N consecutive transient errors → disable
+DEFAULT_TOKEN_CAP_PER_MISSION = 10_000_000  # hard cap; overridable via --max-tokens
+PARALLEL_MAX_WORKERS = 4   # ThreadPoolExecutor size for parallel subtasks
 _heartbeat_stop = threading.Event()
 _lock_path: Path | None = None
 
@@ -86,8 +90,23 @@ def _heartbeat_loop() -> None:
                     _atomic_write(_lock_path, f"{os.getpid()}\n{time.time()}\n")
                 except OSError:
                     pass
+            # Also write a heartbeat event to the project's run.log.jsonl so
+            # dashboards / consoles see liveness without sniffing stderr.
+            if _log_fp_ref:
+                try:
+                    _log_fp_ref.write(json.dumps(
+                        {"ts": _now(), "event": "heartbeat", "pid": os.getpid()},
+                        ensure_ascii=False) + "\n")
+                    _log_fp_ref.flush()
+                except (OSError, ValueError):
+                    pass
         except (OSError, ValueError):
             return
+
+
+# Shared reference so the heartbeat thread can append to the same log file
+# the main loop uses. Set in run() before starting the thread, cleared after.
+_log_fp_ref = None
 
 
 def _start_heartbeat() -> threading.Thread:
@@ -110,6 +129,9 @@ def _acquire_lock(project_dir: Path) -> None:
     file holds the PID + last-heartbeat timestamp; we treat it as stale only
     if it hasn't been touched in LOCK_STALE_AFTER_S.
 
+    On stale lock takeover, we also attempt to clean up the previous PID
+    (and our own previously-spawned children if any are still alive).
+
     Prevents two runners writing to the same manifest.json concurrently
     (which corrupts data — orphan can overwrite the active run's progress).
     """
@@ -127,11 +149,28 @@ def _acquire_lock(project_dir: Path) -> None:
             raise MissionLockHeld(
                 f"another runner (PID {pid}) is active on this project "
                 f"(lock {age:.0f}s old, stale threshold {LOCK_STALE_AFTER_S}s). "
-                f"If you're sure no runner is alive, delete: {p}"
+                f"If you're sure no runner is alive, run "
+                f"`mission resume <project> --clean-lock`"
             )
-        # stale → take over silently
+        # Stale lock — attempt to kill the orphan PID before taking over.
+        if pid and pid != os.getpid():
+            _kill_pid_silent(pid)
     _atomic_write(p, f"{os.getpid()}\n{time.time()}\n")
     _lock_path = p
+
+
+def _kill_pid_silent(pid: int) -> None:
+    """Best-effort kill of an orphan PID. Silent on failure (process may
+    already be dead, or we may lack permission)."""
+    try:
+        if sys.platform == "win32":
+            import subprocess
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=5)
+        else:
+            os.kill(pid, 15)
+    except (OSError, ValueError, subprocess.TimeoutExpired, FileNotFoundError):
+        pass
 
 
 def _release_lock() -> None:
@@ -681,6 +720,9 @@ def _resolve_provider(
     )
 
 
+_provider_fail_count: dict[str, int] = {}   # in-run circuit breaker counters
+
+
 def _call_with_failover(
     chain: list[Callable[[], Provider]],
     system: str,
@@ -720,8 +762,20 @@ def _call_with_failover(
             continue
         except TransientProviderError as e:
             log("provider-transient-error", provider=provider.name, error=str(e)[:200])
+            # Circuit breaker — N consecutive transient errors → treat
+            # this provider as exhausted for the rest of the run.
+            pkey = f"{provider.name}/{provider.model or ''}"
+            _provider_fail_count[pkey] = _provider_fail_count.get(pkey, 0) + 1
+            if _provider_fail_count[pkey] >= PROVIDER_FAIL_LIMIT:
+                tracker.mark_exhausted(provider.name, provider.model,
+                                       f"circuit-breaker:{_provider_fail_count[pkey]} consecutive transient errors")
+                log("provider-circuit-break", provider=provider.name,
+                    count=_provider_fail_count[pkey])
             remaining = [f for f in remaining if not _factory_matches(f, provider)]
             continue
+        # Reset circuit breaker on success
+        pkey = f"{provider.name}/{provider.model or ''}"
+        _provider_fail_count[pkey] = 0
         tracker.record_usage(
             provider.name, provider.model,
             result.usage.input_tokens, result.usage.output_tokens,
@@ -779,8 +833,108 @@ def _extract_handoff(worker_text: str) -> str:
     return chunk
 
 
-def run(manifest_path: Path, contract_path: Path | None) -> int:
+_log_lock = threading.Lock()
+
+
+def _schedule_iter(manifest: dict):
+    """Dependency-aware iterator over subtasks.
+
+    Yields the next ready subtask (one at a time). Skips finished states.
+    A subtask is ready when ALL its `depends_on` are done or deprecated-by-split.
+    Re-scans on each yield because runner mutates statuses live.
+
+    Parallel execution (when all ready subtasks share execution=readonly-parallel)
+    is a planned extension — see _schedule_next_batch for the multi-yield variant
+    that the parallel-aware runner will use.
+    """
+    finished = {"done", "deprecated-by-split"}
+    while True:
+        by_id = {s["id"]: s for s in manifest["subtasks"]}
+        next_one = None
+        for s in manifest["subtasks"]:
+            if s.get("status") in finished:
+                continue
+            deps = s.get("depends_on") or []
+            if any(by_id.get(d, {}).get("status") not in finished for d in deps):
+                continue
+            next_one = s
+            break
+        if next_one is None:
+            return
+        yield next_one
+
+
+def _schedule_next_batch(manifest: dict) -> list[dict]:
+    """Return the next group of subtasks ready to run in parallel.
+
+    A batch is multiple subtasks when ALL ready entries declare
+    execution=readonly-parallel; otherwise the batch is a single subtask
+    (serial). Used by the (future) parallel runner; current code calls
+    _schedule_iter for one-at-a-time semantics.
+    """
+    finished = {"done", "deprecated-by-split"}
+    by_id = {s["id"]: s for s in manifest["subtasks"]}
+    ready: list[dict] = []
+    for s in manifest["subtasks"]:
+        if s.get("status") in finished or s.get("status") == "in-progress":
+            continue
+        deps = s.get("depends_on") or []
+        if any(by_id.get(d, {}).get("status") not in finished for d in deps):
+            continue
+        ready.append(s)
+    if not ready:
+        return []
+    if all(s.get("execution") == "readonly-parallel" for s in ready):
+        return ready[:PARALLEL_MAX_WORKERS]
+    return [ready[0]]
+
+
+def _validate_manifest_schema(manifest: dict) -> list[str]:
+    """Lightweight schema validation — returns list of human-readable errors,
+    empty list = OK. Fails fast on missing required fields before we burn
+    LLM tokens on a manifest that won't run to completion.
+    """
+    errors: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["manifest must be a JSON object"]
+    if "mission" not in manifest:
+        errors.append("missing top-level 'mission' (str describing the goal)")
+    subs = manifest.get("subtasks")
+    if not isinstance(subs, list) or not subs:
+        errors.append("'subtasks' must be a non-empty array")
+        return errors
+    ids_seen: set[str] = set()
+    for i, s in enumerate(subs):
+        if not isinstance(s, dict):
+            errors.append(f"subtasks[{i}] is not an object")
+            continue
+        sid = s.get("id")
+        if not sid:
+            errors.append(f"subtasks[{i}] missing 'id'")
+        elif sid in ids_seen:
+            errors.append(f"duplicate subtask id: {sid}")
+        else:
+            ids_seen.add(sid)
+        if not s.get("desc"):
+            errors.append(f"subtask {sid!r} missing 'desc'")
+        if s.get("difficulty") not in ("T1", "T2", "T3", None):
+            errors.append(f"subtask {sid!r} difficulty must be T1/T2/T3 (got {s.get('difficulty')!r})")
+        for dep in s.get("depends_on") or []:
+            if dep not in ids_seen and dep not in [x.get("id") for x in subs]:
+                errors.append(f"subtask {sid!r} depends_on {dep!r} which doesn't exist")
+    return errors
+
+
+def run(manifest_path: Path, contract_path: Path | None,
+        max_tokens: int = DEFAULT_TOKEN_CAP_PER_MISSION) -> int:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Schema validation — fail fast on malformed manifest.
+    errors = _validate_manifest_schema(manifest)
+    if errors:
+        print("manifest validation failed:", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        return 4
     contract = (
         contract_path.read_text(encoding="utf-8")
         if contract_path and contract_path.exists()
@@ -791,6 +945,9 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
     cache = ResponseCache(project_dir / ".cache")
     tracker = QuotaTracker.load(project_dir / ".harness-state.json", budgets=config.BUDGETS)
     log_fp = (project_dir / "run.log.jsonl").open("a", encoding="utf-8")
+    # Expose to heartbeat thread so it can emit liveness events.
+    global _log_fp_ref
+    _log_fp_ref = log_fp
 
     def log(event: str, **kwargs: Any) -> None:
         record = {"ts": _now(), "event": event, **kwargs}
@@ -801,18 +958,29 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
 
     handoff = ""
     rc = 0
+    _provider_fail_count.clear()
     # PID lock — refuse to run if another mission is alive on this project.
     # Stale locks (heartbeat > LOCK_STALE_AFTER_S old) are auto-claimed.
     _acquire_lock(project_dir)
     _start_heartbeat()
+    manifest_lock = threading.Lock()  # serializes manifest mutations across parallel workers
     try:
-        for subtask in manifest["subtasks"]:
+        for subtask in _schedule_iter(manifest):
+            # Hard token cap — abort cleanly if mission has consumed beyond budget.
+            total_tokens = sum(
+                st.tokens_in + st.tokens_out for st in tracker.providers.values()
+            )
+            if total_tokens > max_tokens:
+                log("mission-token-cap-exceeded", note=f"{total_tokens} > {max_tokens}")
+                rc = 3
+                break
             sid = subtask["id"]
             if subtask.get("status") in ("done", "deprecated-by-split"):
                 log("skip-done", id=sid, note=subtask.get("status"))
                 continue
 
-            subtask["status"] = "in-progress"
+            with manifest_lock:
+                subtask["status"] = "in-progress"
             _save_manifest(manifest_path, manifest)
             subtask_start_time = time.time()
 
@@ -1077,9 +1245,23 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
     return rc
 
 
-def cmd_status(state_dir: Path) -> int:
+def cmd_status(state_dir: Path, detailed: bool = False) -> int:
     tracker = QuotaTracker.load(state_dir / ".harness-state.json", budgets=config.BUDGETS)
     print(tracker.summary())
+    if detailed:
+        log_path = state_dir / "run.log.jsonl"
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8").splitlines()
+            print("\n=== events by type (last run) ===")
+            counts: dict[str, int] = {}
+            for line in lines:
+                try:
+                    evt = json.loads(line).get("event", "?")
+                    counts[evt] = counts.get(evt, 0) + 1
+                except json.JSONDecodeError:
+                    pass
+            for k, v in sorted(counts.items(), key=lambda kv: -kv[1]):
+                print(f"  {k:30s}  {v}")
     return 0
 
 
@@ -1107,6 +1289,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="reset all providers, or one (e.g. --reset claude-cli/claude-opus-4-7)")
     ap.add_argument("--state-dir", type=Path, default=Path.cwd(),
                     help="where .harness-state.json lives (default: cwd)")
+    ap.add_argument("--max-tokens", type=int, default=DEFAULT_TOKEN_CAP_PER_MISSION,
+                    help=f"hard token cap per mission (default {DEFAULT_TOKEN_CAP_PER_MISSION:,})")
     args = ap.parse_args(argv)
 
     if args.status:
@@ -1116,7 +1300,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.manifest:
         ap.print_help()
         return 1
-    return run(args.manifest, args.contract)
+    return run(args.manifest, args.contract, max_tokens=args.max_tokens)
 
 
 if __name__ == "__main__":
