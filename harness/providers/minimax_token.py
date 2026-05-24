@@ -100,7 +100,12 @@ class MinimaxToken(Provider):
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Create or overwrite a file under the working directory.",
+                "description": (
+                    "Create a NEW file or COMPLETELY replace one. "
+                    "⚠️ DO NOT USE for modifying an existing file — use `patch_file` instead. "
+                    "Use only when (a) the file doesn't exist yet, or (b) you genuinely want "
+                    "to wipe ALL existing content and start over. Misuse wipes other code."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -108,6 +113,30 @@ class MinimaxToken(Provider):
                         "content": {"type": "string", "description": "Full file content"},
                     },
                     "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "patch_file",
+                "description": (
+                    "SURGICAL edit of an existing file. Finds an EXACT string and replaces it. "
+                    "PREFERRED tool for any 'add this key', 'modify this function', 'fix this line' "
+                    "task. Preserves everything else on disk untouched. "
+                    "The `find` string MUST appear EXACTLY ONCE in the file — include enough "
+                    "surrounding context (e.g. 2-3 lines) to make it unique. If it appears 0 or "
+                    "≥2 times, the tool returns an error and you must call read_file first to see "
+                    "the actual content and provide a more specific anchor."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path":    {"type": "string", "description": "Path relative to cwd"},
+                        "find":    {"type": "string", "description": "Exact string to locate (must be unique in file)"},
+                        "replace": {"type": "string", "description": "String to replace `find` with"},
+                    },
+                    "required": ["path", "find", "replace"],
                 },
             },
         },
@@ -247,6 +276,39 @@ class MinimaxToken(Provider):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
                 return f"OK: wrote {len(content)} chars to {rel}"
+            elif name == "patch_file":
+                # Surgical find/replace — preserves everything else.
+                # Required: `find` must appear EXACTLY ONCE to prevent
+                # accidental multi-site edits.
+                rel = args.get("path", "").strip()
+                find_str = args.get("find", "")
+                replace_str = args.get("replace", "")
+                if not rel or rel.startswith(("/", "\\")) or ".." in Path(rel).parts:
+                    return f"ERROR: unsafe path {rel!r}"
+                if not find_str:
+                    return ("ERROR: `find` is empty. To CREATE a new file use write_file. "
+                            "To APPEND, set `find` to the last line of the file and `replace` "
+                            "to that same line + your new content.")
+                target = cwd / rel
+                target.resolve().relative_to(cwd)
+                if not target.exists():
+                    return (f"ERROR: {rel} does not exist. Use write_file to create it, "
+                            "or read_file to inspect the directory first.")
+                original = target.read_text(encoding="utf-8")
+                count = original.count(find_str)
+                if count == 0:
+                    snippet = original[:300].replace("\n", "\\n")
+                    return (f"ERROR: `find` not found in {rel}. File starts: {snippet!r}…\n"
+                            "Call read_file first to see the exact existing content, then "
+                            "supply a `find` string that matches it byte-for-byte.")
+                if count > 1:
+                    return (f"ERROR: `find` appears {count} times in {rel}. Make it more specific "
+                            "by including 2-3 lines of surrounding context, then retry.")
+                patched = original.replace(find_str, replace_str, 1)
+                target.write_text(patched, encoding="utf-8")
+                size_delta = len(patched) - len(original)
+                return (f"OK: patched {rel} — replaced {len(find_str)} chars with "
+                        f"{len(replace_str)} chars ({'+' if size_delta>=0 else ''}{size_delta} net)")
             elif name == "read_file":
                 rel = args.get("path", "").strip()
                 if not rel or ".." in Path(rel).parts:

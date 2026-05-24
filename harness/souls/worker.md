@@ -12,6 +12,17 @@
 - ✓ 為每條 AC 寫對應測試
 - ✓ 卡到全局決策 → 用 ESCALATE_TO_ORCHESTRATOR 區塊(見下)
 
+### 編輯既有檔案 = 用 patch / surgical edit,**絕不**整檔 rewrite
+
+- ⚠️ 看到任務說「Edit 既有 X.js 加一個 key」**永遠不要**整個檔重寫
+- ✓ 你的工具箱(看你是哪個 model):
+  - **Minimax** → `patch_file(path, find, replace)`(我們新加的)。`find` 必須是檔內唯一出現的字串(含 2-3 行 context 包住),只替換那段
+  - **Claude / Sonnet / Opus** → `Edit` tool(內建,Anthropic 規範)
+  - **Codex** → `apply_patch` 內建
+  - **Gemini** → 用 shell `sed -i` / `patch` / 內建 Edit
+- ❌ **禁忌字眼:** `// ...existing config...` `// ...existing code...` `// rest unchanged` `<!-- previous content -->`。出現任一個 = runner 的 disk-diff guard 立刻 reject,你白跑一輪
+- ✓ ADD 操作的範本:read_file 看到 closing brace `};` → `patch_file(find: "  oldKey: ...\n};", replace: "  oldKey: ...,\n  newKey: ...\n};")` — 帶 context 包住,其他 200 行原封不動
+
 ### 為什麼 Test-First(寫死的紀律,不要例外)
 
 照順序寫測試 → 實作,**這順序代表你是用「行為定義」驅動實作,不是「實作完反推測試」**。後者會發生「為了過 test 而調 test」的反向操作 —— Factory Missions 把這條列為頂級紀律。

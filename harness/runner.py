@@ -364,7 +364,10 @@ _DELETE_MARKER_RE = re.compile(r"\(DELETE\)\s*$", re.IGNORECASE)
 
 # Files we DON'T snapshot — generated, vendored, or noise.
 _SNAPSHOT_SKIP_DIRS = {".git", "node_modules", ".cache", "out", "__pycache__",
-                       ".harness-cache", ".pytest_cache", "dist", "build"}
+                       ".harness-cache", ".pytest_cache", "dist", "build",
+                       "artifacts"}  # artifacts/ is runner-managed — never
+                                      # treat changes to old worker artifacts
+                                      # as regressions in a new subtask
 # Only files of these extensions get tracked. Conservative — text source only.
 _SNAPSHOT_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".html",
                   ".css", ".yaml", ".yml", ".toml"}
