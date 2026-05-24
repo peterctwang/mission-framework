@@ -348,6 +348,146 @@ _FILE_ENTRY_RE = re.compile(
 _DELETE_MARKER_RE = re.compile(r"\(DELETE\)\s*$", re.IGNORECASE)
 
 
+# ── Worker disk-diff guard ────────────────────────────────────────────────
+#
+# Background: Minimax & Gemini have both been observed to "rewrite" a file
+# when asked to "add a key" — wiping all other exports/constants in the
+# process. The synthetic validators sometimes pass these (they only see the
+# worker's text artifact, not disk diffs), so we have to catch it in the
+# runner before validator wastes its call.
+#
+# Approach: snapshot the workspace immediately before the worker runs, then
+# after FILES_TO_WRITE is applied, diff the snapshot. If any tracked file
+# shrunk dramatically or now contains a known "stub placeholder" string,
+# treat it as an immediate disk-verify reject — same path as missing files.
+
+# Files we DON'T snapshot — generated, vendored, or noise.
+_SNAPSHOT_SKIP_DIRS = {".git", "node_modules", ".cache", "out", "__pycache__",
+                       ".harness-cache", ".pytest_cache", "dist", "build"}
+# Only files of these extensions get tracked. Conservative — text source only.
+_SNAPSHOT_EXTS = {".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".md", ".html",
+                  ".css", ".yaml", ".yml", ".toml"}
+# Files smaller than this are too short to meaningfully regress.
+_SNAPSHOT_MIN_SIZE = 200
+# Phrases that strongly suggest the worker substituted a placeholder for
+# real content — case-insensitive substring match.
+_STUB_MARKERS = (
+    "...existing config...",
+    "...existing code...",
+    "// existing code here",
+    "# existing code here",
+    "<!-- existing content -->",
+    "...rest of file...",
+    "...rest of code...",
+    "...previous content...",
+    "/* unchanged */",
+    "// (rest unchanged)",
+)
+# A file that lost more than this fraction of its bytes is suspicious.
+_SHRINK_THRESHOLD = 0.40   # kept ≥40% of original bytes is "ok"; below = suspect
+# Or that lost more than this many distinct top-level symbols.
+_SYMBOL_LOSS_THRESHOLD = 5
+
+_SYMBOL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:function|const|let|var|class|def)\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def _snapshot_workspace(project_dir: Path) -> dict[str, dict]:
+    """Snapshot text source files: {relpath: {size, symbols: set[str], head256}}.
+
+    `head256` is the first 256 chars of the file — used to fingerprint
+    identity-preserving rewrites (same file, contents replaced).
+    """
+    snap: dict[str, dict] = {}
+    if not project_dir.exists():
+        return snap
+    for p in project_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        # Skip files inside opted-out directories
+        parts = set(p.relative_to(project_dir).parts)
+        if parts & _SNAPSHOT_SKIP_DIRS:
+            continue
+        if p.suffix.lower() not in _SNAPSHOT_EXTS:
+            continue
+        try:
+            data = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if len(data) < _SNAPSHOT_MIN_SIZE:
+            continue
+        symbols = set(_SYMBOL_RE.findall(data))
+        rel = p.relative_to(project_dir).as_posix()
+        snap[rel] = {
+            "size": len(data),
+            "symbols": symbols,
+            "head256": data[:256],
+        }
+    return snap
+
+
+def _check_workspace_regression(
+    snapshot_before: dict[str, dict],
+    project_dir: Path,
+    log: Callable[..., None],
+    subtask_id: str,
+) -> list[str]:
+    """Compare current workspace to snapshot. Returns human-readable
+    regression descriptions ('' if clean)."""
+    issues: list[str] = []
+    for relpath, before in snapshot_before.items():
+        p = project_dir / relpath
+        if not p.exists():
+            issues.append(f"{relpath}: file deleted (was {before['size']} bytes)")
+            continue
+        try:
+            data = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        # Stub placeholder check — fires regardless of size.
+        lower = data.lower()
+        for marker in _STUB_MARKERS:
+            if marker.lower() in lower:
+                issues.append(
+                    f"{relpath}: contains stub placeholder '{marker}' — "
+                    f"worker wrote a skeleton instead of the full file"
+                )
+                break
+        # Shrink check
+        ratio = len(data) / max(before["size"], 1)
+        if ratio < _SHRINK_THRESHOLD:
+            issues.append(
+                f"{relpath}: shrunk {before['size']}→{len(data)} bytes "
+                f"({ratio:.0%}, threshold {_SHRINK_THRESHOLD:.0%})"
+            )
+        # Symbol loss check — count named top-level symbols that disappeared.
+        after_syms = set(_SYMBOL_RE.findall(data))
+        lost = before["symbols"] - after_syms
+        if len(lost) >= _SYMBOL_LOSS_THRESHOLD:
+            sample = ", ".join(sorted(lost)[:8])
+            issues.append(
+                f"{relpath}: lost {len(lost)} named symbols (e.g. {sample})"
+            )
+        # Critical-export check — any UPPER_SNAKE_CASE name lost is suspicious
+        # even alone (PROVIDER_ABBR-style constants are typically module
+        # exports that the rest of the codebase depends on).
+        critical_lost = [s for s in lost
+                         if len(s) >= 4 and s.isupper().__class__
+                         and s.replace("_", "").isalnum()
+                         and s.upper() == s and any(c.isalpha() for c in s)]
+        if critical_lost and not any("lost" in i for i in issues):
+            issues.append(
+                f"{relpath}: lost critical UPPER_CASE export(s): "
+                + ", ".join(sorted(critical_lost)[:6])
+            )
+    if issues:
+        log("disk-diff-regression", id=subtask_id, count=len(issues),
+            note=issues[0][:160])
+    return issues
+
+
 def _verify_worker_artifacts(worker_output: str, project_dir: Path,
                                log: Callable[..., None], subtask_id: str) -> list[str]:
     """After worker-done, check that files claimed in FILES_TO_WRITE actually
@@ -1003,6 +1143,11 @@ def run(manifest_path: Path, contract_path: Path | None,
             # hard → Opus. See harness/config.py::WORKER_TIERS.
             worker_chain = config.worker_chain(subtask)
             difficulty = subtask.get("difficulty", "T2")
+            # Snapshot the workspace BEFORE the worker runs so we can detect
+            # regressions (file rewrites that wipe other exports) afterwards.
+            # This catches Minimax/Gemini stub-rewrites that pass naive
+            # validation but break the rest of the project.
+            workspace_before = _snapshot_workspace(project_dir)
             log("worker-start", id=sid, note=f"difficulty={difficulty}")
             worker_out, worker_used, _ = _call_with_failover(
                 worker_chain, worker_system, worker_user,
@@ -1017,6 +1162,29 @@ def run(manifest_path: Path, contract_path: Path | None,
             n_files = _apply_files_to_write(worker_out, project_dir, log, sid)
             if n_files:
                 log("files-applied", id=sid, count=n_files)
+
+            # Disk-diff guard — compare snapshot vs current workspace. Any
+            # file that shrunk dramatically, lost ≥5 named symbols, or now
+            # contains a "...existing config..." stub marker is treated as a
+            # regression and fed into the same reject path as missing files.
+            regressions = _check_workspace_regression(
+                workspace_before, project_dir, log, sid,
+            )
+            if regressions and subtask.get("needs_validator", False):
+                synth_reject = (
+                    "DISK DIFF REGRESSION — Worker corrupted existing files:\n"
+                    + "\n".join(f"  • {r}" for r in regressions[:8])
+                    + "\n\nThis usually means the worker rewrote a whole file when "
+                    "asked to add or modify a section. Re-emit ONLY the targeted "
+                    "change (use Edit tool / patch syntax, not Write/rewrite). "
+                    "The file's other exports, constants, and functions MUST be "
+                    "preserved exactly.\n\n判決:打回"
+                )
+                _save_artifact(out_dir, sid, "disk-diff-reject", synth_reject)
+                log("disk-diff-reject", id=sid, note=f"{len(regressions)} regressions")
+                worker_out = (worker_out
+                              + "\n\n[RUNTIME NOTE — disk diff regressions]\n"
+                              + "\n".join(regressions[:8]))
 
             # Disk verification — fail-fast if Worker claimed files that
             # don't exist on disk. Avoids wasting a Validator call on
