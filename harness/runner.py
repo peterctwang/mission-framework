@@ -960,19 +960,97 @@ def _apply_replan(subtask: dict, decision: dict, manifest: dict) -> None:
 
 
 def _relevant_contract(contract: str, covers: list[str]) -> str:
+    """Filter contract to only the AC items listed in `covers`.
+
+    Supports two contract formats:
+      A) Legacy prose:  `- **AC-1**: description...` (line-based)
+      B) Structured (v0.4.0): fenced ```json ... {"acs": [{"id":"AC-1",...}]}```
+
+    For structured contracts, the returned excerpt is a human-readable
+    rendering of the relevant AC entries — Validator sees the same info
+    whether the contract is prose or structured.
+    """
     if not contract or not covers:
         return contract
+    covers_set = set(covers)
+
+    # Try structured (B) first — extract fenced ```json blocks containing "acs":
+    structured_acs = _extract_structured_acs(contract)
+    if structured_acs:
+        relevant = [ac for ac in structured_acs if ac.get("id") in covers_set]
+        if relevant:
+            out = ["## In-scope acceptance criteria (structured)"]
+            for ac in relevant:
+                out.append(f"\n### {ac.get('id', '?')}")
+                if ac.get("desc"):
+                    out.append(f"**Description:** {ac['desc']}")
+                check = ac.get("check") or {}
+                if check:
+                    out.append("**Mechanical check (runner pre-verifies):**")
+                    out.append("```json")
+                    out.append(json.dumps(check, indent=2, ensure_ascii=False))
+                    out.append("```")
+            return "\n".join(out)
+
+    # Fall back to legacy line-based filter
     lines = contract.splitlines()
     keep: list[str] = []
     keeping = False
     for line in lines:
         m = re.match(r"\s*[-*]?\s*\*{0,2}(AC-[A-Za-z0-9_.]+)", line)
         if m:
-            keeping = m.group(1) in covers
+            keeping = m.group(1) in covers_set
         if keeping or line.startswith("#") or not line.strip():
             keep.append(line)
     excerpt = "\n".join(keep).strip()
     return excerpt or contract
+
+
+def _format_ac_pre_checks(
+    contract: str,
+    covers: list[str],
+    project_dir: Path,
+    workspace_before: dict[str, dict],
+) -> str:
+    """Run mechanical AC checks declared in contract for in-scope covers,
+    return a human-readable summary the Validator can use as evidence.
+
+    Returns empty string if no structured ACs or no in-scope ones with checks.
+    """
+    acs = _extract_structured_acs(contract)
+    if not acs:
+        return ""
+    covers_set = set(covers or [])
+    relevant = [ac for ac in acs if ac.get("id") in covers_set and ac.get("check")]
+    if not relevant:
+        return ""
+    bytes_before = {p: meta["size"] for p, meta in workspace_before.items()}
+    results = _run_structured_ac_checks(relevant, project_dir, bytes_before)
+    lines = ["## Mechanical AC pre-checks (runner already verified these)"]
+    for r in results:
+        sym = {"pass": "✓", "fail": "✗", "unchecked": "·",
+               "error": "!"}.get(r["verdict"], "?")
+        lines.append(f"- {sym} {r['ac']} [{r['verdict']}]: {r['evidence']}")
+    lines.append("\nTrust these results unless you can prove them wrong by reading the file directly. "
+                 "Your job is the subjective/semantic part — not re-grep what's already checked.")
+    return "\n".join(lines)
+
+
+def _extract_structured_acs(contract: str) -> list[dict]:
+    """Pull AC objects from any fenced ```json block declaring {"acs":[...]}.
+
+    Returns a flat list of AC dicts. Empty list if no structured block found.
+    """
+    blocks = re.findall(r"```json\s*\n(.*?)\n```", contract, re.DOTALL)
+    out: list[dict] = []
+    for body in blocks:
+        try:
+            obj = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("acs"), list):
+            out.extend(ac for ac in obj["acs"] if isinstance(ac, dict))
+    return out
 
 
 def _content_hash(*parts: str) -> str:
@@ -1563,9 +1641,11 @@ def _run_subtask_parallel_lite(
             validator_system = _build_system("validator", mode=mode)
             covers = subtask.get("covers") or []
             scope = _relevant_contract(contract, covers) or ac_excerpt
+            pre_checks = _format_ac_pre_checks(contract, covers, project_dir, workspace_before)
             validator_user = (
                 f"## In-scope acceptance criteria (THESE ONLY)\n{scope}\n\n"
-                f"Subtask covers exactly: {covers}\n\n"
+                + (f"{pre_checks}\n\n" if pre_checks else "")
+                + f"Subtask covers exactly: {covers}\n\n"
                 f"## Worker output\n{worker_out[:8000]}\n"
             )
             log("validator-start", id=sid, attempt=1)
@@ -1933,11 +2013,13 @@ def run(manifest_path: Path, contract_path: Path | None,
                     log("subtask-timeout", id=sid, note=f"exceeded {SUBTASK_WALL_TIME_S}s wall-time")
                     timed_out = True
                     break
+                pre_checks_text = _format_ac_pre_checks(contract, covers, project_dir, workspace_before)
                 validator_user = (
                     f"## Subtask requirement\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
                     f"## In-scope acceptance criteria (THESE ONLY — do not check others)\n"
                     f"{validator_scope}\n\n"
-                    f"Subtask covers exactly: {', '.join(covers) if covers else '(none — verify nothing)'}\n\n"
+                    + (f"{pre_checks_text}\n\n" if pre_checks_text else "")
+                    + f"Subtask covers exactly: {', '.join(covers) if covers else '(none — verify nothing)'}\n\n"
                     f"## Artifact under review\n{worker_out}\n"
                 )
                 log("validator-start", id=sid, attempt=attempt)
