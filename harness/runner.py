@@ -448,11 +448,21 @@ def _check_workspace_regression(
     project_dir: Path,
     log: Callable[..., None],
     subtask_id: str,
+    scope_writes: list[str] | None = None,
 ) -> list[str]:
     """Compare current workspace to snapshot. Returns human-readable
-    regression descriptions ('' if clean)."""
+    regression descriptions ('' if clean).
+
+    `scope_writes` (v0.4.0) — files the worker is ALLOWED to write/restructure.
+    For these files we skip shrinkage / symbol-loss / critical-export checks:
+    the worker has explicit permission to refactor. The stub-placeholder check
+    still fires (a file containing literal '...existing config...' is broken
+    regardless of who wrote it). All other (out-of-scope) files get the full
+    check — they shouldn't have changed at all.
+    """
     issues: list[str] = []
     for relpath, before in snapshot_before.items():
+        in_scope = bool(scope_writes) and _path_in_scope(relpath, scope_writes or [])
         p = project_dir / relpath
         if not p.exists():
             issues.append(f"{relpath}: file deleted (was {before['size']} bytes)")
@@ -461,7 +471,8 @@ def _check_workspace_regression(
             data = p.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        # Stub placeholder check — fires regardless of size.
+        # Stub placeholder check — always fires (stub markers in any file are
+        # broken regardless of in-scope status).
         lower = data.lower()
         for marker in _STUB_MARKERS:
             if marker.lower() in lower:
@@ -470,6 +481,10 @@ def _check_workspace_regression(
                     f"worker wrote a skeleton instead of the full file"
                 )
                 break
+        # In-scope files: worker has permission to restructure. Skip
+        # shrinkage / symbol-loss / critical-export checks.
+        if in_scope:
+            continue
         # Shrink check
         ratio = len(data) / max(before["size"], 1)
         if ratio < _SHRINK_THRESHOLD:
@@ -1621,7 +1636,8 @@ def _run_subtask_parallel_lite(
             log("files-applied", id=sid, count=n)
 
         # Disk-diff guard
-        regressions = _check_workspace_regression(workspace_before, project_dir, log, sid)
+        regressions = _check_workspace_regression(workspace_before, project_dir, log, sid,
+                                                   scope_writes=scope_writes)
         if regressions:
             log("disk-diff-reject", id=sid, note=f"parallel {len(regressions)} regressions")
             result["note"] = "; ".join(regressions[:3])
@@ -1876,6 +1892,7 @@ def run(manifest_path: Path, contract_path: Path | None,
             # regression and fed into the same reject path as missing files.
             regressions = _check_workspace_regression(
                 workspace_before, project_dir, log, sid,
+                scope_writes=scope_writes,
             )
             if regressions and subtask.get("needs_validator", False):
                 synth_reject = (
