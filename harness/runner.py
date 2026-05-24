@@ -77,6 +77,7 @@ LOCK_STALE_AFTER_S = 60     # 3× heartbeat — orphan if lock not touched
 PROVIDER_FAIL_LIMIT = 3     # circuit breaker: N consecutive transient errors → disable
 DEFAULT_TOKEN_CAP_PER_MISSION = 10_000_000  # hard cap; overridable via --max-tokens
 PARALLEL_MAX_WORKERS = 4   # ThreadPoolExecutor size for parallel subtasks
+PARALLEL_RETRY_CAP = 2     # after N parallel failures, downgrade to serial
 _heartbeat_stop = threading.Event()
 _lock_path: Path | None = None
 
@@ -412,6 +413,16 @@ def _snapshot_workspace(project_dir: Path) -> dict[str, dict]:
             continue
         if p.suffix.lower() not in _SNAPSHOT_EXTS:
             continue
+        # Don't snapshot mission-control files (manifest / state / ledger /
+        # log). Workers should never touch these — the _apply_files_to_write
+        # guard already blocks them. Snapshotting them creates noisy false
+        # positives when the runner itself mutates them during the worker run.
+        _name = p.name
+        if (_name in ("ledger.json", ".harness-state.json", "run.log.jsonl",
+                      ".harness.lock")
+                or (_name.startswith("manifest") and _name.endswith(".json"))
+                or _name.startswith(".harness")):
+            continue
         try:
             data = p.read_text(encoding="utf-8", errors="ignore")
         except OSError:
@@ -548,6 +559,18 @@ def _apply_files_to_write(worker_output: str, project_dir: Path,
         # Drop accidental drive letters on Windows
         if len(clean_path) > 1 and clean_path[1] == ":":
             log("files-skip-unsafe", id=subtask_id, path=clean_path)
+            continue
+        # Mission-control files — workers must never touch these.
+        # manifest*.json / .harness-state.json / .harness.lock / run.log.jsonl /
+        # ledger.json all belong to the runner, not the worker.
+        _name = Path(clean_path).name
+        _MISSION_CONTROL = ("run.log.jsonl", ".harness.lock", ".harness-state.json",
+                            "ledger.json")
+        if (_name in _MISSION_CONTROL
+                or (_name.startswith("manifest") and _name.endswith(".json"))
+                or _name.startswith(".harness")):
+            log("files-skip-mission-control", id=subtask_id, path=clean_path,
+                note="worker tried to overwrite runner-owned file — blocked")
             continue
 
         target = project_dir / clean_path
@@ -1339,12 +1362,16 @@ def _run_subtask_parallel_lite(
         workspace_before = _snapshot_workspace(project_dir)
         log("worker-start", id=sid, note=f"parallel difficulty={subtask.get('difficulty','T2')}")
         worker_chain = config.worker_chain(subtask)
-        # _call_with_failover takes its own lock on tracker writes via the
-        # provided tracker_lock — keeps QuotaTracker state file consistent.
+        # Parallel mode bypasses the response cache:
+        #   1. Cache-poisoning risk — a previously-failed run's stub response
+        #      gets replayed and all 3 parallel workers return broken output
+        #      simultaneously (observed in production).
+        #   2. Cache HIT in parallel mode means LLM calls weren't really made,
+        #      defeating the point of parallelism (no wall-time win).
         worker_out, worker_used, _ = _call_with_failover(
             worker_chain, worker_system, worker_user,
             role="worker", cache=cache, tracker=tracker, forbidden=None, log=log,
-            cwd=str(project_dir),
+            cwd=str(project_dir), use_cache=False,
         )
         log("worker-done", id=sid, provider=worker_used.name, model=worker_used.model)
         _save_artifact(out_dir, sid, "worker", worker_out)
@@ -1490,11 +1517,27 @@ def run(manifest_path: Path, contract_path: Path | None,
                                  "note": f"thread crash: {type(e).__name__}"}
                             log("parallel-thread-crash", id=s["id"], note=str(e)[:200])
                         with manifest_lock:
+                            # Track parallel attempts per subtask. After 2
+                            # rejects in parallel mode, downgrade `execution`
+                            # so the next scheduler iteration picks it up via
+                            # the SERIAL path (which has full validator
+                            # retries + fix-features escalation to Opus).
+                            attempts = s.get("_parallel_attempts", 0)
+                            if r["status"] != "done":
+                                attempts += 1
+                                s["_parallel_attempts"] = attempts
+                                if attempts >= PARALLEL_RETRY_CAP:
+                                    s["execution"] = "serial"
+                                    log("parallel-downgrade-to-serial", id=s["id"],
+                                        note=f"after {attempts} parallel failures")
                             s["status"] = r["status"]
                             s.pop("_parallel_peers", None)
                             if r.get("note"):
                                 s["note"] = r["note"]
-                        _save_manifest(manifest_path, manifest)
+                            # Keep _save_manifest INSIDE the lock — Windows
+                            # os.replace fails with PermissionError if two
+                            # threads race to atomic-write the same path.
+                            _save_manifest(manifest_path, manifest)
                         if r["status"] == "done" and r.get("handoff"):
                             handoff = r["handoff"]
                 log("parallel-batch-done", note=f"{len(batch)} subtasks: {','.join(ids)}")
