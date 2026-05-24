@@ -32,7 +32,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1223,10 +1223,15 @@ def _schedule_iter(manifest: dict):
 def _schedule_next_batch(manifest: dict) -> list[dict]:
     """Return the next group of subtasks ready to run in parallel.
 
-    A batch is multiple subtasks when ALL ready entries declare
-    execution=readonly-parallel; otherwise the batch is a single subtask
-    (serial). Used by the (future) parallel runner; current code calls
-    _schedule_iter for one-at-a-time semantics.
+    Decision rule (Orchestrator-set, per-subtask `execution` field):
+      • If the FIRST ready subtask is `readonly-parallel`, scoop up every
+        other ready `readonly-parallel` subtask up to PARALLEL_MAX_WORKERS
+        — they all run concurrently in a ThreadPoolExecutor.
+      • Otherwise (first is `serial` or unset) → return [first] alone.
+
+    Mixed batches are NOT supported: a serial subtask must finish before
+    any parallel batch starts. This keeps the invariant that
+    `readonly-parallel` subtasks see a stable filesystem during their run.
     """
     finished = {"done", "deprecated-by-split"}
     by_id = {s["id"]: s for s in manifest["subtasks"]}
@@ -1240,8 +1245,10 @@ def _schedule_next_batch(manifest: dict) -> list[dict]:
         ready.append(s)
     if not ready:
         return []
-    if all(s.get("execution") == "readonly-parallel" for s in ready):
-        return ready[:PARALLEL_MAX_WORKERS]
+    # First ready subtask decides the batch mode.
+    if ready[0].get("execution") == "readonly-parallel":
+        batch = [s for s in ready if s.get("execution") == "readonly-parallel"]
+        return batch[:PARALLEL_MAX_WORKERS]
     return [ready[0]]
 
 
@@ -1279,6 +1286,124 @@ def _validate_manifest_schema(manifest: dict) -> list[str]:
             if dep not in ids_seen and dep not in [x.get("id") for x in subs]:
                 errors.append(f"subtask {sid!r} depends_on {dep!r} which doesn't exist")
     return errors
+
+
+def _run_subtask_parallel_lite(
+    subtask: dict,
+    *,
+    project_dir: Path,
+    out_dir: Path,
+    contract: str,
+    ledger: "MissionLedger",
+    ledger_lock: threading.Lock,
+    cache: Any,
+    tracker: QuotaTracker,
+    tracker_lock: threading.Lock,
+    log: Callable[..., None],
+) -> dict:
+    """Run ONE subtask end-to-end inside a thread, for the parallel batch path.
+
+    Simpler than the serial flow:
+      • No escalation handling (a readonly-parallel subtask shouldn't need it).
+      • No fix-features pattern (any reject marks the subtask `rework` and
+        the next serial cycle / Orchestrator can deal with it).
+      • Worker + Validator each get ONE attempt.
+
+    Returns: {id, status, worker_out, handoff, note}
+    `status` is one of: done / rework.
+    """
+    sid = subtask["id"]
+    result = {"id": sid, "status": "rework", "worker_out": "", "handoff": "", "note": ""}
+    try:
+        ac_excerpt = _relevant_contract(contract, subtask.get("covers") or [])
+        worker_system = _build_system("worker")
+        with ledger_lock:
+            ledger_ctx = ledger.as_worker_context()
+        peers = subtask.get("_parallel_peers", [])
+        peer_note = (
+            "\n\n## Parallel execution note\nYou are running CONCURRENTLY with: "
+            + ", ".join(p for p in peers if p != sid)
+            + ". These subtasks are marked `readonly-parallel` — file conflicts "
+            "(two workers writing the same file) will be caught by the disk-diff "
+            "guard and rejected. Stay strictly within the files your subtask names."
+            if peers else ""
+        )
+        worker_user = (
+            f"## Current subtask\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
+            f"## Relevant validation contract items\n{ac_excerpt}\n\n"
+            + (f"{ledger_ctx}\n\n" if ledger_ctx else "")
+            + peer_note
+        )
+
+        # Snapshot for disk-diff guard.
+        workspace_before = _snapshot_workspace(project_dir)
+        log("worker-start", id=sid, note=f"parallel difficulty={subtask.get('difficulty','T2')}")
+        worker_chain = config.worker_chain(subtask)
+        # _call_with_failover takes its own lock on tracker writes via the
+        # provided tracker_lock — keeps QuotaTracker state file consistent.
+        worker_out, worker_used, _ = _call_with_failover(
+            worker_chain, worker_system, worker_user,
+            role="worker", cache=cache, tracker=tracker, forbidden=None, log=log,
+            cwd=str(project_dir),
+        )
+        log("worker-done", id=sid, provider=worker_used.name, model=worker_used.model)
+        _save_artifact(out_dir, sid, "worker", worker_out)
+        result["worker_out"] = worker_out
+
+        n = _apply_files_to_write(worker_out, project_dir, log, sid)
+        if n:
+            log("files-applied", id=sid, count=n)
+
+        # Disk-diff guard
+        regressions = _check_workspace_regression(workspace_before, project_dir, log, sid)
+        if regressions:
+            log("disk-diff-reject", id=sid, note=f"parallel {len(regressions)} regressions")
+            result["note"] = "; ".join(regressions[:3])
+            return result
+
+        missing = _verify_worker_artifacts(worker_out, project_dir, log, sid)
+        if missing and subtask.get("needs_validator", False):
+            result["note"] = f"missing files: {','.join(missing[:3])}"
+            log("disk-verify-reject", id=sid, note=f"parallel missing {len(missing)}")
+            return result
+
+        # Validator (if needed). Single attempt — parallel mode doesn't retry.
+        if subtask.get("needs_validator", False):
+            validator_chain = config.VALIDATOR_CHAIN
+            kind = subtask.get("validation_kind", "scrutiny")
+            mode = "functional" if kind == "functional" else "default"
+            validator_system = _build_system("validator", mode=mode)
+            covers = subtask.get("covers") or []
+            scope = _relevant_contract(contract, covers) or ac_excerpt
+            validator_user = (
+                f"## In-scope acceptance criteria (THESE ONLY)\n{scope}\n\n"
+                f"Subtask covers exactly: {covers}\n\n"
+                f"## Worker output\n{worker_out[:8000]}\n"
+            )
+            log("validator-start", id=sid, attempt=1)
+            v_out, v_used, _ = _call_with_failover(
+                validator_chain, validator_system, validator_user,
+                role="validator", cache=cache, tracker=tracker, forbidden=None,
+                log=log, cwd=str(project_dir),
+            )
+            _save_artifact(out_dir, sid, f"validator-attempt-1", v_out)
+            passed = _parse_verdict(v_out)
+            log("validator-done", id=sid, attempt=1, provider=v_used.name,
+                model=v_used.model, note=f"verdict={'pass' if passed else 'reject'}")
+            if not passed:
+                result["note"] = "validator-reject (parallel single-attempt)"
+                return result
+
+        # Success
+        result["status"] = "done"
+        result["handoff"] = _extract_handoff(worker_out)
+        with ledger_lock:
+            ledger.record(sid, worker_out)
+        return result
+    except Exception as e:
+        log("parallel-exception", id=sid, note=type(e).__name__ + ": " + str(e)[:200])
+        result["note"] = f"{type(e).__name__}: {str(e)[:200]}"
+        return result
 
 
 def run(manifest_path: Path, contract_path: Path | None,
@@ -1324,8 +1449,58 @@ def run(manifest_path: Path, contract_path: Path | None,
     _acquire_lock(project_dir)
     _start_heartbeat()
     manifest_lock = threading.Lock()  # serializes manifest mutations across parallel workers
+    ledger_lock = threading.Lock()    # serializes ledger.record() append + persist
+    tracker_lock = threading.Lock()   # serializes QuotaTracker writes
     try:
-        for subtask in _schedule_iter(manifest):
+        # Main scheduler loop. _schedule_next_batch returns either:
+        #   [single subtask]                  → serial path (existing full flow)
+        #   [N readonly-parallel subtasks]    → dispatch to ThreadPoolExecutor
+        # The decision is Orchestrator-driven via the per-subtask `execution`
+        # field in the manifest.
+        while True:
+            batch = _schedule_next_batch(manifest)
+            if not batch:
+                break
+            # PARALLEL PATH ───────────────────────────────────────────────
+            if len(batch) > 1:
+                ids = [s["id"] for s in batch]
+                log("parallel-batch-start", note=f"{len(batch)} subtasks: {','.join(ids)}")
+                # Mark all in-progress + record peers so each worker knows
+                # who else is running concurrently.
+                with manifest_lock:
+                    for s in batch:
+                        s["status"] = "in-progress"
+                        s["_parallel_peers"] = ids
+                _save_manifest(manifest_path, manifest)
+                with ThreadPoolExecutor(max_workers=PARALLEL_MAX_WORKERS) as ex:
+                    futures = {
+                        ex.submit(_run_subtask_parallel_lite, s,
+                                  project_dir=project_dir, out_dir=out_dir,
+                                  contract=contract, ledger=ledger,
+                                  ledger_lock=ledger_lock, cache=cache,
+                                  tracker=tracker, tracker_lock=tracker_lock,
+                                  log=log): s for s in batch
+                    }
+                    for fut in as_completed(futures):
+                        s = futures[fut]
+                        try:
+                            r = fut.result()
+                        except Exception as e:
+                            r = {"id": s["id"], "status": "rework", "handoff": "",
+                                 "note": f"thread crash: {type(e).__name__}"}
+                            log("parallel-thread-crash", id=s["id"], note=str(e)[:200])
+                        with manifest_lock:
+                            s["status"] = r["status"]
+                            s.pop("_parallel_peers", None)
+                            if r.get("note"):
+                                s["note"] = r["note"]
+                        _save_manifest(manifest_path, manifest)
+                        if r["status"] == "done" and r.get("handoff"):
+                            handoff = r["handoff"]
+                log("parallel-batch-done", note=f"{len(batch)} subtasks: {','.join(ids)}")
+                continue
+            # SERIAL PATH ───── (single subtask; existing full flow) ──────
+            subtask = batch[0]
             # Hard token cap — abort cleanly if mission has consumed beyond budget.
             total_tokens = sum(
                 st.tokens_in + st.tokens_out for st in tracker.providers.values()

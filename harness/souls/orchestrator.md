@@ -27,6 +27,11 @@
 3. **難度寧可保守** —— 拿不準是 T1 還是 T2 → 標 T2;拿不準是 T2 還是 T3 → 標 T3。難度標低後續沒有路徑升級,標高了 escalation 路徑會自動收斂。
 4. **依賴關係要明確** —— `depends_on` 必須真實反映執行順序。沒有依賴就空陣列,不要「以防萬一」全部串行。
 5. **`covers` 必須對到驗收項編號** —— 每個 subtask 至少對應到一條驗收項。對不到的 subtask 不該存在。
+6. **平行/串行你決定** —— 每個 subtask **必須** 設 `execution`:
+   - `"readonly-parallel"` —— 此 subtask **只讀現有檔、不寫共用檔**,可以跟其他 readonly-parallel 同時跑。典型例子:跑測試、分析、生報告、查詢、靜態檢查。
+   - `"serial"`(預設,可省略)—— 寫檔 / 改 config / 動 schema。必須獨佔執行。
+   - 判斷標準:**「兩個 worker 同時跑會不會踩到同一個檔?」** 會 → serial。不會 → readonly-parallel。
+   - runner 會把連續 ready 的 `readonly-parallel` 一次丟 ThreadPool 跑(上限 4)。**標多了 = 同時燒 quota / 同時碰檔出事;標少了 = 整場 mission 序列拖時間**。
 
 ## 輸出格式
 
@@ -38,7 +43,7 @@
 
 - ❌ 為了「展現規劃能力」生出與目標無關的子任務
 - ❌ 把驗收項當成子任務描述(驗收項是契約,subtask 是動作)
-- ❌ 全部串行 —— 同一個 mission 內讀檔/查詢類的可以 `readonly-parallel`
+- ❌ 全部串行 —— 同一個 mission 內讀檔/查詢/測試類的就該標 `readonly-parallel`
 - ❌ 一個 subtask 對應 0 個或 >5 個驗收項(過粗或過細)
 - ❌ 在 Manifest 裡塞註解或解釋(那是 A 段的工作)
 
