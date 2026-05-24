@@ -531,8 +531,155 @@ def _verify_worker_artifacts(worker_output: str, project_dir: Path,
     return missing
 
 
+# ── Subtask scope enforcement (v0.4.0) ────────────────────────────────────
+#
+# Each subtask may declare `scope.writes` = list of paths/globs the worker
+# is allowed to create/modify. The runner enforces this at FILES_TO_WRITE
+# materialization time — any write outside scope is rejected with a
+# `files-out-of-scope` log event.
+#
+# Why this matters:
+#   - Workers (Minimax especially) sometimes write to manifest/artifacts/
+#     contract files when confused.
+#   - Validator scope leakage: Codex grep'd outside subtask's domain.
+#   - Parallel batches: explicit scope makes "no file conflict" provable.
+#
+# Backward-compatible: subtasks without `scope` accept any path.
+
+import fnmatch as _fnmatch
+
+
+def _run_structured_ac_checks(
+    contract_acs: list[dict],
+    project_dir: Path,
+    bytes_before: dict[str, int],
+) -> list[dict]:
+    """Run mechanical AC checks declared in `contract.acs[*].check`.
+
+    Each check supports:
+        file:               relative path to inspect
+        must_contain:       string or list — all must be present
+        must_not_contain:   string or list — none may be present
+        byte_floor_ratio:   after/before ≥ ratio (preservation guard)
+        regex_match:        pattern that must fullmatch somewhere
+        min_size:           absolute byte minimum
+
+    Returns: [{ac, verdict, evidence}, ...]
+    """
+    out = []
+    for ac in contract_acs:
+        ac_id = ac.get("id", "")
+        check = ac.get("check") or {}
+        if not check:
+            out.append({"ac": ac_id, "verdict": "unchecked",
+                        "evidence": "no structured check declared"})
+            continue
+        fpath = check.get("file")
+        if not fpath:
+            out.append({"ac": ac_id, "verdict": "error",
+                        "evidence": "check.file missing"})
+            continue
+        target = project_dir / fpath
+        if not target.exists():
+            out.append({"ac": ac_id, "verdict": "fail",
+                        "evidence": f"file not found: {fpath}"})
+            continue
+        try:
+            data = target.read_text(encoding="utf-8", errors="ignore")
+        except OSError as e:
+            out.append({"ac": ac_id, "verdict": "error",
+                        "evidence": f"read error: {e}"})
+            continue
+
+        failures = []
+        # must_contain
+        mc = check.get("must_contain")
+        if mc:
+            if isinstance(mc, str):
+                mc = [mc]
+            for needle in mc:
+                if needle not in data:
+                    failures.append(f"missing '{needle[:60]}'")
+        # must_not_contain
+        mnc = check.get("must_not_contain")
+        if mnc:
+            if isinstance(mnc, str):
+                mnc = [mnc]
+            for forbidden in mnc:
+                if forbidden in data:
+                    failures.append(f"forbidden '{forbidden[:60]}' present")
+        # byte_floor_ratio
+        bfr = check.get("byte_floor_ratio")
+        if bfr:
+            before = bytes_before.get(fpath, len(data))  # if no before, treat as no-change
+            if before > 0:
+                ratio = len(data) / before
+                if ratio < bfr:
+                    failures.append(
+                        f"shrunk {before}→{len(data)} (ratio {ratio:.2f} < {bfr})"
+                    )
+        # regex_match
+        rx = check.get("regex_match")
+        if rx:
+            import re as _re
+            if not _re.search(rx, data):
+                failures.append(f"regex /{rx[:40]}/ no match")
+        # min_size
+        ms = check.get("min_size")
+        if ms and len(data) < ms:
+            failures.append(f"size {len(data)} < min {ms}")
+
+        if failures:
+            out.append({"ac": ac_id, "verdict": "fail",
+                        "evidence": "; ".join(failures[:3])})
+        else:
+            out.append({"ac": ac_id, "verdict": "pass",
+                        "evidence": f"all checks passed on {fpath}"})
+    return out
+
+
+def _path_in_scope(rel_path: str, scope_writes: list[str]) -> bool:
+    """Check if a write path matches any glob in scope.writes. Glob semantics:
+        frontend/layout.js   → exact match
+        frontend/widgets/*.js → any .js DIRECT child of widgets/ (no subdirs)
+        frontend/**/*.js     → recursive — any .js under frontend/ at any depth
+        **/x.js              → any x.js at any depth
+    Crucially `*` does NOT cross `/` boundary; only `**` does.
+    """
+    if not scope_writes:
+        return True  # no scope declared = unrestricted (old manifest)
+    import re as _re
+    norm = rel_path.replace("\\", "/")
+    for pattern in scope_writes:
+        pat = pattern.replace("\\", "/")
+        parts: list[str] = []
+        i = 0
+        while i < len(pat):
+            # `**/` = zero or more directory segments
+            if pat[i:i+3] == "**/":
+                parts.append("(?:[^/]+/)*")
+                i += 3
+            elif pat[i:i+2] == "**":
+                parts.append(".*")
+                i += 2
+            elif pat[i] == "*":
+                parts.append("[^/]*")
+                i += 1
+            elif pat[i] == "?":
+                parts.append("[^/]")
+                i += 1
+            else:
+                parts.append(_re.escape(pat[i]))
+                i += 1
+        regex = "".join(parts)
+        if _re.fullmatch(regex, norm):
+            return True
+    return False
+
+
 def _apply_files_to_write(worker_output: str, project_dir: Path,
-                           log: Callable[..., None], subtask_id: str) -> int:
+                           log: Callable[..., None], subtask_id: str,
+                           scope_writes: list[str] | None = None) -> int:
     """Parse the `## FILES_TO_WRITE` section of a Worker output and materialize
     every file on disk under project_dir. This is the safety net for providers
     that can't use tools (Minimax) or that lie about using them (Sonnet
@@ -577,6 +724,12 @@ def _apply_files_to_write(worker_output: str, project_dir: Path,
                 or _name.startswith(".harness")):
             log("files-skip-mission-control", id=subtask_id, path=clean_path,
                 note="worker tried to overwrite runner-owned file — blocked")
+            continue
+        # Subtask scope (v0.4.0) — if the subtask declared scope.writes,
+        # writes outside that allow-list are rejected.
+        if scope_writes and not _path_in_scope(clean_path, scope_writes):
+            log("files-out-of-scope", id=subtask_id, path=clean_path,
+                note=f"not in scope.writes={scope_writes}")
             continue
 
         target = project_dir / clean_path
@@ -1343,6 +1496,8 @@ def _run_subtask_parallel_lite(
     """
     sid = subtask["id"]
     result = {"id": sid, "status": "rework", "worker_out": "", "handoff": "", "note": ""}
+    # Per-subtask scope for the v0.4.0 runner-enforced file allow-list.
+    scope_writes = (subtask.get("scope") or {}).get("writes") or []
     try:
         ac_excerpt = _relevant_contract(contract, subtask.get("covers") or [])
         worker_system = _build_system("worker")
@@ -1383,7 +1538,7 @@ def _run_subtask_parallel_lite(
         _save_artifact(out_dir, sid, "worker", worker_out)
         result["worker_out"] = worker_out
 
-        n = _apply_files_to_write(worker_out, project_dir, log, sid)
+        n = _apply_files_to_write(worker_out, project_dir, log, sid, scope_writes=scope_writes)
         if n:
             log("files-applied", id=sid, count=n)
 
@@ -1585,9 +1740,24 @@ def run(manifest_path: Path, contract_path: Path | None,
                 subtask.get("desc", "") + " " + manifest.get("mission", ""),
             )
             ledger_ctx = ledger.as_worker_context()
+            # Subtask scope (v0.4.0) — explicit allow-list of files the
+            # worker may create/modify. Runner enforces this; communicate
+            # it loudly so the worker doesn't even try to wander.
+            scope = subtask.get("scope") or {}
+            scope_writes = scope.get("writes") or []
+            scope_block = ""
+            if scope_writes:
+                scope_block = (
+                    "## Scope (RUNNER-ENFORCED — violations rejected before validator)\n"
+                    "You MAY write to ONLY these paths (globs allowed):\n"
+                    + "\n".join(f"  - `{p}`" for p in scope_writes)
+                    + "\nAny FILES_TO_WRITE entry outside this list will be SILENTLY DROPPED "
+                    "by the runner. Do not waste a turn trying.\n"
+                )
             worker_user = (
                 f"## Current subtask\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
-                f"## Relevant validation contract items\n{ac_excerpt}\n\n"
+                + (f"{scope_block}\n" if scope_block else "")
+                + f"## Relevant validation contract items\n{ac_excerpt}\n\n"
                 + (f"{skill_ctx}\n\n" if skill_ctx else "")
                 + (f"{ledger_ctx}\n\n" if ledger_ctx else "")
                 + f"## Previous handoff (most recent — full text)\n{handoff or '(none — first subtask)'}\n"
@@ -1603,6 +1773,8 @@ def run(manifest_path: Path, contract_path: Path | None,
             # This catches Minimax/Gemini stub-rewrites that pass naive
             # validation but break the rest of the project.
             workspace_before = _snapshot_workspace(project_dir)
+            # Per-path byte counts for structured AC byte_floor_ratio checks.
+            bytes_before = {p: meta["size"] for p, meta in workspace_before.items()}
             log("worker-start", id=sid, note=f"difficulty={difficulty}")
             worker_out, worker_used, _ = _call_with_failover(
                 worker_chain, worker_system, worker_user,
@@ -1614,7 +1786,7 @@ def run(manifest_path: Path, contract_path: Path | None,
             # Safety net — materialize any `## FILES_TO_WRITE` content the
             # Worker emitted (handles providers without tool use and
             # providers that claim success without writing).
-            n_files = _apply_files_to_write(worker_out, project_dir, log, sid)
+            n_files = _apply_files_to_write(worker_out, project_dir, log, sid, scope_writes=scope_writes)
             if n_files:
                 log("files-applied", id=sid, count=n_files)
 
@@ -1692,7 +1864,7 @@ def run(manifest_path: Path, contract_path: Path | None,
                         use_cache=False,
                     )
                     _save_artifact(out_dir, sid, "worker.after-directive", worker_out)
-                    n = _apply_files_to_write(worker_out, project_dir, log, sid)
+                    n = _apply_files_to_write(worker_out, project_dir, log, sid, scope_writes=scope_writes)
                     if n: log("files-applied", id=sid, count=n, stage="after-directive")
 
                 # On REPLAN: manifest was already patched by _resolve_escalation.
@@ -1716,7 +1888,7 @@ def run(manifest_path: Path, contract_path: Path | None,
                         use_cache=False,
                     )
                     _save_artifact(out_dir, sid, "worker.after-replan", worker_out)
-                    n = _apply_files_to_write(worker_out, project_dir, log, sid)
+                    n = _apply_files_to_write(worker_out, project_dir, log, sid, scope_writes=scope_writes)
                     if n: log("files-applied", id=sid, count=n, stage="after-replan")
 
                 # PROCEED_AS_IS or unparseable decision → keep original output.
@@ -1837,7 +2009,7 @@ def run(manifest_path: Path, contract_path: Path | None,
                     cwd=str(project_dir), use_cache=False,
                 )
                 _save_artifact(out_dir, sid, f"worker.attempt{attempt + 1}", worker_out)
-                _apply_files_to_write(worker_out, project_dir, log, sid)
+                _apply_files_to_write(worker_out, project_dir, log, sid, scope_writes=scope_writes)
                 log("worker-retry-done", id=sid, attempt=attempt + 1,
                     provider=worker_used.name, model=worker_used.model)
                 attempt += 1
