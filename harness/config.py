@@ -61,9 +61,11 @@ def _make_minimax() -> Provider:
 # =============================================================================
 
 # Master planner — Opus first, no compromise on quality of decomposition.
+# Gemini 2.5 Pro slotted between Codex and Sonnet (strong reasoner, free OAuth quota).
 ORCHESTRATOR_CHAIN: list[Factory] = [
     _make_claude,         # Opus 4.7 — best decomposition
     _make_codex,          # fallback if Anthropic quota hits
+    _make_gemini,         # Gemini 2.5 Pro — backup reasoner
     _make_claude_sonnet,
     _make_minimax,
 ]
@@ -72,14 +74,17 @@ ORCHESTRATOR_CHAIN: list[Factory] = [
 WORKER_TIERS: dict[str, list[Factory]] = {
     "T1": [_make_minimax,         # easy → cheap & fast
            _make_claude_sonnet,   # if Minimax exhausted
+           _make_gemini,          # Gemini backup
            _make_codex,
            _make_claude],
     "T2": [_make_claude_sonnet,   # standard → Sonnet sweet spot
            _make_claude,          # bump up to Opus if Sonnet exhausted
+           _make_gemini,          # Gemini backup (similar tier to Sonnet)
            _make_codex,
            _make_minimax],
     "T3": [_make_claude,          # hard → Opus
            _make_claude_sonnet,   # downgrade if Opus exhausted
+           _make_gemini,          # Gemini 2.5 Pro — strong reasoner backup
            _make_codex,
            _make_minimax],
 }
@@ -88,6 +93,7 @@ WORKER_TIERS: dict[str, list[Factory]] = {
 VALIDATOR_CHAIN: list[Factory] = [
     _make_codex,          # primary
     _make_minimax,        # also reliable for structured verdict output
+    _make_gemini,         # Gemini backup — has directive-mode preamble
     _make_claude_sonnet,  # last resort — leave Opus reserved for Orchestrator
     _make_claude,
 ]
