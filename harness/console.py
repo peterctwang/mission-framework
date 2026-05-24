@@ -52,19 +52,23 @@ def _read_state(project: Path) -> QuotaTracker:
 
 
 def _read_manifest(project: Path) -> dict | None:
-    p = project / "manifest.json"
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
-            return None
+    """Pick the most recently modified manifest-shaped JSON file in project.
+
+    This auto-tracks the active mission even when you maintain multiple
+    manifest-*.json files in one project dir (e.g. v1 + visual-upgrade).
+    Falls back to manifest.json by name if no candidate has 'subtasks'.
+    """
+    candidates: list[tuple[float, dict]] = []
     for q in project.glob("*.json"):
         try:
             data = json.loads(q.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError):
             continue
-        if "subtasks" in data and "mission" in data:
-            return data
+        if isinstance(data, dict) and "subtasks" in data and "mission" in data:
+            candidates.append((q.stat().st_mtime, data))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return None
 
 
@@ -227,8 +231,10 @@ class ConsoleApp(App):
         ptable.add_columns("", "Provider", "In", "Out", "Calls", "Status")
         ttable = self.query_one("#tasks-table", DataTable)
         ttable.add_columns("ID", "Description", "Diff", "Profile", "V", "Status")
-        # state
-        self._known_events_count = 0
+        # Track total log lines we've already rendered. Using absolute line
+        # number means new events are detected correctly even after the
+        # tail-window slides past LOG_TAIL_LINES.
+        self._last_event_line_no = -1   # -1 = first refresh shows the tail
         self.refresh_all()
         self.set_interval(REFRESH_SECONDS, self.refresh_all)
 
@@ -331,10 +337,28 @@ class ConsoleApp(App):
             )
 
     def _refresh_events(self) -> None:
-        events = _read_log_tail(self.project, LOG_TAIL_LINES)
+        """Tail run.log.jsonl by absolute line number — slides correctly
+        once the log exceeds LOG_TAIL_LINES, unlike the old tail-window
+        comparison which got stuck once `len(tail) == LOG_TAIL_LINES`."""
+        log_path = self.project / "run.log.jsonl"
+        if not log_path.exists():
+            return
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        total = len(lines)
+        if self._last_event_line_no < 0:
+            # First refresh — show the tail (last LOG_TAIL_LINES events).
+            start = max(0, total - LOG_TAIL_LINES)
+        else:
+            start = self._last_event_line_no
+        if start >= total:
+            return  # nothing new
+
         log = self.query_one("#events-log", RichLog)
-        new = events[self._known_events_count:]
-        for evt in new:
+        for raw in lines[start:]:
+            try:
+                evt = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
             ts = evt.get("ts", "")[-8:]
             ev = evt.get("event", "?")
             color = self._event_color(ev)
@@ -344,7 +368,7 @@ class ConsoleApp(App):
                     detail_bits.append(f"{k}={v}")
             detail = "  ".join(detail_bits)
             log.write(f"[dim]{ts}[/]  [{color}]{ev:<24}[/]  [dim]{detail}[/]")
-        self._known_events_count = len(events)
+        self._last_event_line_no = total
 
     @staticmethod
     def _event_color(ev: str) -> str:

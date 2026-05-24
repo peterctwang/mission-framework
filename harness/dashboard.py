@@ -64,19 +64,19 @@ def _read_state(project: Path) -> QuotaTracker:
 
 
 def _read_manifest(project: Path) -> dict | None:
-    p = project / "manifest.json"
-    if p.exists():
+    # Pick the most recently modified manifest-shaped JSON. Tracks the
+    # active mission when multiple manifest-*.json coexist.
+    candidates: list[tuple[float, dict]] = []
+    for q in project.glob("*.json"):
         try:
-            return json.loads(p.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
-            return None
-    for p in project.glob("*.json"):
-        try:
-            data = json.loads(p.read_text(encoding="utf-8-sig"))
-        except json.JSONDecodeError:
+            data = json.loads(q.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
             continue
-        if "subtasks" in data and "mission" in data:
-            return data
+        if isinstance(data, dict) and "subtasks" in data and "mission" in data:
+            candidates.append((q.stat().st_mtime, data))
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
     return None
 
 

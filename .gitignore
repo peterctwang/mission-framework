@@ -15,6 +15,7 @@ build/
 
 # Per-project state (created by the runner inside the consumer's project)
 .harness-state.json
+.harness.lock
 .cache/
 artifacts/
 run.log.jsonl

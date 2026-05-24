@@ -84,7 +84,12 @@ class QuotaTracker:
             "providers": {k: asdict(v) for k, v in self.providers.items()},
             "updated_at": time.time(),
         }
-        self.state_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Atomic write — tmp + replace so concurrent readers (dashboard, TUI)
+        # never see a half-written JSON file.
+        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        import os as _os
+        _os.replace(tmp, self.state_path)
 
     def get(self, provider_name: str, model: str | None) -> ProviderState:
         key = self._key(provider_name, model)

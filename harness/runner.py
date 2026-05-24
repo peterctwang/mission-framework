@@ -30,6 +30,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -56,7 +58,90 @@ TURN_CAPS = {
     "orchestrator": 30,
 }
 
+# Wall-time cap per subtask (including all retries + fix-features). Once
+# exceeded the subtask is marked rework and the mission moves on, so a stuck
+# loop can't consume the whole token budget.
+SUBTASK_WALL_TIME_S = 30 * 60   # 30 minutes
+
 HANDOFF_WORD_CAP = 200
+
+# Long-running Worker calls (Sonnet / Opus writing for 5-10 minutes) leave the
+# parent Python silent while subprocess.run blocks. Some harnesses (background
+# task monitors, supervisord watchdogs) interpret extended silence as a dead
+# process and reap. The heartbeat thread writes a single line to stderr every
+# 30s so the parent is visibly alive AND touches the PID lock so other runners
+# know we're still here.
+HEARTBEAT_INTERVAL_S = 30
+LOCK_STALE_AFTER_S = 90   # if lock hasn't been touched in 90s, treat as orphan
+_heartbeat_stop = threading.Event()
+_lock_path: Path | None = None
+
+
+def _heartbeat_loop() -> None:
+    while not _heartbeat_stop.wait(HEARTBEAT_INTERVAL_S):
+        try:
+            print(f"[{_now()}] heartbeat :: runner alive", file=sys.stderr, flush=True)
+            if _lock_path:
+                try:
+                    _atomic_write(_lock_path, f"{os.getpid()}\n{time.time()}\n")
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            return
+
+
+def _start_heartbeat() -> threading.Thread:
+    _heartbeat_stop.clear()
+    t = threading.Thread(target=_heartbeat_loop, daemon=True, name="mission-heartbeat")
+    t.start()
+    return t
+
+
+def _stop_heartbeat() -> None:
+    _heartbeat_stop.set()
+
+
+class MissionLockHeld(RuntimeError):
+    """Another runner has a fresh lock on this project."""
+
+
+def _acquire_lock(project_dir: Path) -> None:
+    """Refuse to start if another runner is alive on this project. The lock
+    file holds the PID + last-heartbeat timestamp; we treat it as stale only
+    if it hasn't been touched in LOCK_STALE_AFTER_S.
+
+    Prevents two runners writing to the same manifest.json concurrently
+    (which corrupts data — orphan can overwrite the active run's progress).
+    """
+    global _lock_path
+    p = project_dir / ".harness.lock"
+    if p.exists():
+        try:
+            content = p.read_text(encoding="utf-8").strip().splitlines()
+            pid = int(content[0]) if content else 0
+            last_beat = float(content[1]) if len(content) > 1 else 0
+        except (OSError, ValueError, IndexError):
+            pid, last_beat = 0, 0
+        age = time.time() - last_beat
+        if age < LOCK_STALE_AFTER_S:
+            raise MissionLockHeld(
+                f"another runner (PID {pid}) is active on this project "
+                f"(lock {age:.0f}s old, stale threshold {LOCK_STALE_AFTER_S}s). "
+                f"If you're sure no runner is alive, delete: {p}"
+            )
+        # stale → take over silently
+    _atomic_write(p, f"{os.getpid()}\n{time.time()}\n")
+    _lock_path = p
+
+
+def _release_lock() -> None:
+    global _lock_path
+    if _lock_path and _lock_path.exists():
+        try:
+            _lock_path.unlink()
+        except OSError:
+            pass
+    _lock_path = None
 
 
 def _find_dotenv() -> Path | None:
@@ -112,8 +197,19 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content to path via tmp + os.replace — atomic on POSIX and Windows
+    (NTFS). Prevents corrupt half-written files when the process is killed
+    mid-write. Used for manifest, state, cache, lock — anything a reader
+    might read concurrently or that the runner re-loads after restart.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def _save_manifest(path: Path, manifest: dict) -> None:
-    path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    _atomic_write(path, json.dumps(manifest, indent=2, ensure_ascii=False))
 
 
 def _save_artifact(out_dir: Path, subtask_id: str, label: str, content: str) -> Path:
@@ -211,6 +307,34 @@ _FILE_ENTRY_RE = re.compile(
     re.DOTALL,
 )
 _DELETE_MARKER_RE = re.compile(r"\(DELETE\)\s*$", re.IGNORECASE)
+
+
+def _verify_worker_artifacts(worker_output: str, project_dir: Path,
+                               log: Callable[..., None], subtask_id: str) -> list[str]:
+    """After worker-done, check that files claimed in FILES_TO_WRITE actually
+    exist on disk with non-zero size. Returns a list of missing paths (empty
+    = all good). Catches Sonnet's path-normalization bug where the model
+    claims success but writes to the wrong directory.
+    """
+    m = _FILES_BLOCK_RE.search(worker_output)
+    if not m:
+        return []  # no FILES_TO_WRITE block, can't verify
+    body = m.group(1)
+    missing: list[str] = []
+    for entry in _FILE_ENTRY_RE.finditer(body):
+        raw_path = entry.group("path").strip()
+        is_delete = bool(_DELETE_MARKER_RE.search(raw_path))
+        if is_delete:
+            continue
+        rel = _DELETE_MARKER_RE.sub("", raw_path).strip().strip("`")
+        if not rel or rel.startswith(("/", "\\")) or ".." in Path(rel).parts:
+            continue
+        target = project_dir / rel
+        if not target.exists() or target.stat().st_size == 0:
+            missing.append(rel)
+    if missing:
+        log("disk-verify-fail", id=subtask_id, missing=",".join(missing[:5]))
+    return missing
 
 
 def _apply_files_to_write(worker_output: str, project_dir: Path,
@@ -323,12 +447,11 @@ def _resolve_escalation(
         log("orchestrator-resolve-malformed", id=subtask["id"],
             note="no ORCHESTRATOR_DECISION block found")
         return None
-    decision = _extract_json_block(m.group(1))
-    if not decision or "action" not in decision:
+    decision = _normalize_decision(_extract_json_block(m.group(1)))
+    if not decision:
         log("orchestrator-resolve-malformed", id=subtask["id"],
-            note="missing 'action' in decision")
+            note="missing/invalid action in decision")
         return None
-    decision["action"] = decision["action"].upper()
 
     if decision["action"] == "REPLAN":
         _apply_replan(subtask, decision, manifest)
@@ -336,6 +459,36 @@ def _resolve_escalation(
         log("manifest-patched", id=subtask["id"],
             note=f"applied {len(decision.get('subtask_patches', []))} patch(es)")
     return decision
+
+
+def _normalize_decision(raw: dict | None) -> dict | None:
+    """Tolerate the multiple shapes Orchestrator (LLM) emits in practice:
+
+      Canonical:  {"action":"REPLAN","subtask_patches":[{"id":..,"patch":{...}}],"rationale":"..."}
+      Flat:       {"decision":"REPLAN","split_into":[<new subtask>],"rationale":"..."}
+      DIRECTIVE:  {"action":"DIRECTIVE","directive":"...","rationale":"..."}
+
+    Returns normalized canonical shape, or None if unrecoverable.
+    """
+    if not isinstance(raw, dict):
+        return None
+    action = (raw.get("action") or raw.get("decision") or "").strip().upper()
+    if action not in ("DIRECTIVE", "REPLAN", "PROCEED_AS_IS"):
+        return None
+    out = {
+        "action": action,
+        "directive": raw.get("directive", ""),
+        "subtask_patches": raw.get("subtask_patches") or [],
+        "rationale": raw.get("rationale", ""),
+    }
+    # Flat {split_into:[...]} → synthesize subtask_patches that _apply_replan
+    # interprets as "split the current subtask".
+    if action == "REPLAN" and not out["subtask_patches"] and raw.get("split_into"):
+        out["subtask_patches"] = [{
+            "id": "__current__",
+            "patch": {"split_into": raw["split_into"]},
+        }]
+    return out
 
 
 def _orchestrator_decide_fix(
@@ -394,10 +547,10 @@ def _orchestrator_decide_fix(
         log("orchestrator-fix-malformed", id=subtask["id"])
         return None
     decision = _extract_json_block(m.group(1))
-    if not decision or "action" not in decision:
+    decision = _normalize_decision(decision)
+    if not decision:
         log("orchestrator-fix-malformed", id=subtask["id"])
         return None
-    decision["action"] = decision["action"].upper()
     if decision["action"] == "REPLAN":
         _apply_replan(subtask, decision, manifest)
         _save_manifest(manifest_path, manifest)
@@ -418,8 +571,9 @@ def _apply_replan(subtask: dict, decision: dict, manifest: dict) -> None:
     patches = decision.get("subtask_patches", [])
     for p in patches:
         target_id = p.get("id")
-        if target_id != subtask["id"]:
-            # Only the in-flight subtask can be replanned this round.
+        # "__current__" is the synthesized id from _normalize_decision for flat
+        # {split_into:[...]} shape — always applies to the in-flight subtask.
+        if target_id != subtask["id"] and target_id != "__current__":
             continue
         body = p.get("patch", {})
         for field in ("desc", "covers", "difficulty", "depends_on"):
@@ -475,10 +629,23 @@ class ResponseCache:
 
     def get(self, key: str) -> str | None:
         p = self.root / f"{key}.txt"
-        return p.read_text(encoding="utf-8") if p.exists() else None
+        try:
+            return p.read_text(encoding="utf-8") if p.exists() else None
+        except OSError:
+            return None
 
     def put(self, key: str, value: str) -> None:
-        (self.root / f"{key}.txt").write_text(value, encoding="utf-8")
+        # Defensive: external cleanup (rm -rf .cache) between __init__ and put
+        # can race and remove the dir under us — recreate before write.
+        # Atomic: tmp + replace so concurrent readers never see half files.
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            target = self.root / f"{key}.txt"
+            _atomic_write(target, value)
+        except OSError:
+            # Caching is opportunistic. Don't crash the whole mission if the
+            # filesystem refuses one write.
+            pass
 
 
 def _resolve_provider(
@@ -634,6 +801,10 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
 
     handoff = ""
     rc = 0
+    # PID lock — refuse to run if another mission is alive on this project.
+    # Stale locks (heartbeat > LOCK_STALE_AFTER_S old) are auto-claimed.
+    _acquire_lock(project_dir)
+    _start_heartbeat()
     try:
         for subtask in manifest["subtasks"]:
             sid = subtask["id"]
@@ -643,6 +814,7 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
 
             subtask["status"] = "in-progress"
             _save_manifest(manifest_path, manifest)
+            subtask_start_time = time.time()
 
             ac_excerpt = _relevant_contract(contract, subtask.get("covers") or [])
             worker_system = _build_system("worker")
@@ -677,6 +849,26 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
             n_files = _apply_files_to_write(worker_out, project_dir, log, sid)
             if n_files:
                 log("files-applied", id=sid, count=n_files)
+
+            # Disk verification — fail-fast if Worker claimed files that
+            # don't exist on disk. Avoids wasting a Validator call on
+            # output that's obviously broken.
+            missing = _verify_worker_artifacts(worker_out, project_dir, log, sid)
+            if missing and subtask.get("needs_validator", False):
+                # Treat as immediate reject — synthesize a feedback message
+                # the retry loop will use.
+                synth_reject = (
+                    f"DISK VERIFICATION FAILED — Worker claimed FILES_TO_WRITE "
+                    f"entries that do not exist on disk: {', '.join(missing[:10])}.\n\n"
+                    f"Either the Write tool silently wrote to wrong cwd, or the "
+                    f"FILES_TO_WRITE block lied. Re-emit with correct paths and "
+                    f"verify each file actually persists.\n\n判決:打回"
+                )
+                _save_artifact(out_dir, sid, "disk-verify-reject", synth_reject)
+                log("disk-verify-reject", id=sid, note=f"missing {len(missing)} files")
+                # Forge a synthetic validator-reject into the retry loop by
+                # pre-seeding worker_out to include the rejection context.
+                worker_out = worker_out + "\n\n[RUNTIME NOTE — files missing]\n" + ", ".join(missing[:10])
 
             # ── Worker → Orchestrator escalation (max 1 round per subtask) ──
             # If the Worker hit a global / decision boundary it emits an
@@ -765,10 +957,23 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
             attempt = 1
             passed = False
             last_reject_feedback = ""
+            timed_out = False
+            # Strict scope — Validator sees ONLY the AC items in covers,
+            # not the full contract. Prevents "I see AC-N exists in contract,
+            # let me check it too" scope creep observed in L-02 reject loop.
+            covers = subtask.get("covers") or []
+            validator_scope = _relevant_contract(contract, covers)
             while attempt <= 3:
+                # Wall-time guard — break out if subtask has consumed too much time
+                if time.time() - subtask_start_time > SUBTASK_WALL_TIME_S:
+                    log("subtask-timeout", id=sid, note=f"exceeded {SUBTASK_WALL_TIME_S}s wall-time")
+                    timed_out = True
+                    break
                 validator_user = (
-                    f"## Validation contract\n{contract}\n\n"
                     f"## Subtask requirement\n```json\n{json.dumps(subtask, indent=2, ensure_ascii=False)}\n```\n\n"
+                    f"## In-scope acceptance criteria (THESE ONLY — do not check others)\n"
+                    f"{validator_scope}\n\n"
+                    f"Subtask covers exactly: {', '.join(covers) if covers else '(none — verify nothing)'}\n\n"
                     f"## Artifact under review\n{worker_out}\n"
                 )
                 log("validator-start", id=sid, attempt=attempt)
@@ -848,14 +1053,22 @@ def run(manifest_path: Path, contract_path: Path | None) -> int:
             # Don't overwrite status if Orchestrator replaced this subtask
             # with a fix-feature child (status="deprecated-by-split").
             if subtask.get("status") != "deprecated-by-split":
-                subtask["status"] = "done" if passed else "rework"
+                if passed:
+                    subtask["status"] = "done"
+                elif timed_out:
+                    subtask["status"] = "rework"
+                else:
+                    subtask["status"] = "rework"
             handoff = _extract_handoff(worker_out)
             _save_manifest(manifest_path, manifest)
             if subtask.get("status") == "rework":
-                log("subtask-failed", id=sid, note="left as rework — manual intervention required")
+                note = "wall-time exceeded" if timed_out else "left as rework — manual intervention required"
+                log("subtask-failed", id=sid, note=note)
                 rc = 2
                 break
     finally:
+        _stop_heartbeat()
+        _release_lock()
         log_fp.write(json.dumps({"ts": _now(), "event": "run-end", "usage_summary": tracker.summary()},
                                 ensure_ascii=False) + "\n")
         log_fp.close()
